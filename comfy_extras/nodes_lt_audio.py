@@ -26,6 +26,14 @@ class LTXVAudioVAELoader(io.ComfyNode):
     @classmethod
     def execute(cls, ckpt_name: str) -> io.NodeOutput:
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        try:
+            from comfy.ldm.lightricks.mlx import is_mlx_ltx_manifest_path, load_mlx_ltx_checkpoint
+
+            if is_mlx_ltx_manifest_path(ckpt_path):
+                return io.NodeOutput(load_mlx_ltx_checkpoint(ckpt_path)[2])
+        except ImportError:
+            pass
+
         sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
         sd = comfy.utils.state_dict_prefix_replace(sd, {"audio_vae.": "autoencoder.", "vocoder.": "vocoder."}, filter_keys=True)
         vae = comfy.sd.VAE(sd=sd, metadata=metadata)
@@ -77,6 +85,21 @@ class LTXVAudioVAEDecode(io.ComfyNode):
 
     @classmethod
     def execute(cls, samples, audio_vae) -> io.NodeOutput:
+        try:
+            from comfy.ldm.lightricks.mlx import (
+                is_mlx_ltx_media_latent,
+                make_mlx_ltx_audio_proxy,
+                mlx_ltx_media_components,
+                mlx_ltx_media_passthrough_enabled,
+            )
+
+            if is_mlx_ltx_media_latent(samples):
+                if mlx_ltx_media_passthrough_enabled(samples):
+                    return io.NodeOutput(make_mlx_ltx_audio_proxy(samples))
+                return io.NodeOutput(mlx_ltx_media_components(samples).audio)
+        except ImportError:
+            pass
+
         audio_latent = samples["samples"]
         if audio_latent.is_nested:
             audio_latent = audio_latent.unbind()[-1]
@@ -144,6 +167,13 @@ class LTXVEmptyLatentAudio(io.ComfyNode):
         """Generate empty audio latents matching the reference pipeline structure."""
 
         assert audio_vae is not None, "Audio VAE model is required"
+        try:
+            from comfy.ldm.lightricks.mlx import is_mlx_ltx_vae, make_mlx_ltx_audio_placeholder
+
+            if is_mlx_ltx_vae(audio_vae):
+                return io.NodeOutput(make_mlx_ltx_audio_placeholder(frames_number, frame_rate, batch_size))
+        except ImportError:
+            pass
 
         z_channels = audio_vae.latent_channels
         audio_freq = audio_vae.first_stage_model.latent_frequency_bins

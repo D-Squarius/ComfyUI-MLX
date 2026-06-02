@@ -135,9 +135,34 @@ class CreateVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, images: Input.Image, fps: float, audio: Optional[Input.Audio] = None) -> io.NodeOutput:
-        return io.NodeOutput(
-            InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=audio, frame_rate=Fraction(fps)))
-        )
+        try:
+            from comfy.ldm.lightricks.mlx import (
+                is_mlx_ltx_audio_proxy,
+                is_mlx_ltx_image_proxy,
+                materialize_mlx_ltx_audio_proxy,
+                materialize_mlx_ltx_image_proxy,
+                mlx_ltx_video_from_proxy,
+            )
+
+            if is_mlx_ltx_image_proxy(images):
+                if audio is None or (is_mlx_ltx_audio_proxy(audio) and audio.media_path == images.media_path):
+                    video = mlx_ltx_video_from_proxy(images)
+                    return io.NodeOutput(video)
+
+                materialized_images = materialize_mlx_ltx_image_proxy(images)
+                if is_mlx_ltx_audio_proxy(audio):
+                    audio = materialize_mlx_ltx_audio_proxy(audio)
+                video = InputImpl.VideoFromComponents(
+                    Types.VideoComponents(images=materialized_images, audio=audio, frame_rate=Fraction(fps))
+                )
+                return io.NodeOutput(video)
+            if is_mlx_ltx_audio_proxy(audio):
+                audio = materialize_mlx_ltx_audio_proxy(audio)
+        except ImportError:
+            pass
+
+        video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=audio, frame_rate=Fraction(fps)))
+        return io.NodeOutput(video)
 
 class GetVideoComponents(io.ComfyNode):
     @classmethod

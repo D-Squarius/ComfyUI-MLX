@@ -1942,7 +1942,15 @@ def synchronize():
         torch.cuda.synchronize()
 
 def soft_empty_cache(force=False):
+    def empty_optional_mlx_ltx_cache():
+        try:
+            from comfy.ldm.lightricks import mlx as mlx_ltx
+            mlx_ltx.empty_cache()
+        except Exception as e:
+            logging.debug("Optional MLX LTX cache cleanup failed: %s", e)
+
     if cpu_mode():
+        empty_optional_mlx_ltx_cache()
         return
     global cpu_state
     if cpu_state == CPUState.MPS:
@@ -1958,10 +1966,16 @@ def soft_empty_cache(force=False):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+    empty_optional_mlx_ltx_cache()
 
 def unload_all_models():
     for device in get_all_torch_devices():
         free_memory(1e30, device)
+    try:
+        from comfy.ldm.lightricks import mlx as mlx_ltx
+        mlx_ltx.unload_all()
+    except Exception as e:
+        logging.debug("Optional MLX LTX unload failed: %s", e)
 
 def unload_model_and_clones(model: ModelPatcher, unload_additional_models=True, all_devices=False):
     'Unload only model and its clones - primarily for multigpu cloning purposes.'

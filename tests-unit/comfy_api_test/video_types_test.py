@@ -83,6 +83,25 @@ def test_video_from_components_get_duration(video_components):
     assert duration == pytest.approx(expected_duration)
 
 
+def test_video_from_components_save_sanitizes_non_finite_audio(sample_images):
+    audio = AudioInput(
+        {
+            "waveform": torch.tensor([[[0.0, float("nan"), float("inf"), -float("inf")] * 300]], dtype=torch.float32),
+            "sample_rate": 44100,
+        }
+    )
+    video = VideoFromComponents(VideoComponents(images=sample_images, audio=audio, frame_rate=Fraction(30)))
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+
+    try:
+        video.save_to(tmp.name)
+        with av.open(tmp.name) as container:
+            assert any(stream.type == "audio" for stream in container.streams)
+    finally:
+        os.unlink(tmp.name)
+
+
 def test_video_from_components_get_duration_different_frame_rates(sample_images):
     """Duration correct for different frame rates including fractional"""
     # Test with 60 fps

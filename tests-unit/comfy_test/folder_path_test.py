@@ -97,7 +97,20 @@ def test_filter_files_extensions():
     files = ["file1.txt", "file2.jpg", "file3.png", "file4.txt"]
     assert folder_paths.filter_files_extensions(files, [".txt"]) == ["file1.txt", "file4.txt"]
     assert folder_paths.filter_files_extensions(files, [".jpg", ".png"]) == ["file2.jpg", "file3.png"]
+    assert folder_paths.filter_files_extensions(["model.mlx_ltx.json", "config.json"], [".mlx_ltx.json"]) == ["model.mlx_ltx.json"]
+    assert folder_paths.filter_files_extensions(["no_extension", "file.txt"], [""]) == ["no_extension"]
     assert folder_paths.filter_files_extensions(files, []) == files
+
+
+def test_mlx_ltx_model_folder_is_registered(clear_folder_paths):
+    assert folder_paths.get_folder_paths("mlx_ltx")[0].endswith(os.path.join("models", "mlx_ltx"))
+
+
+def test_checkpoints_accept_mlx_ltx_manifest_extension(clear_folder_paths):
+    extensions = folder_paths.folder_names_and_paths["checkpoints"][1]
+
+    assert ".mlx_ltx.json" in extensions
+
 
 @patch("folder_paths.recursive_search")
 @patch("folder_paths.folder_names_and_paths")

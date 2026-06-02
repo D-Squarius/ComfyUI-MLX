@@ -1,5 +1,109 @@
 <div align="center">
 
+# ComfyUI-MLX
+
+Testing fork for Mac MLX backend work before an upstream ComfyUI PR.
+
+**Only the LTX 2.3 MLX backend is implemented so far. This is not a general MLX backend.**
+
+</div>
+
+## Current Status
+
+This public fork is for testing an optional Apple Silicon MLX path for LTX 2.3
+video generation inside ComfyUI. In the workflow, use `CheckpointLoaderSimple`
+and select an MLX LTX model folder from `models/checkpoints`.
+
+Only LTX 2.3 distilled MLX models are implemented so far. The MLX imports stay
+lazy until an MLX LTX model is selected.
+
+## Quick Setup
+
+If you want to keep this fork separate from your normal ComfyUI install, create
+a new venv named `mlxcomfy` from your existing ComfyUI venv. From the
+`ComfyUI-MLX` repo root:
+
+```text
+../ComfyUI/comfy/bin/python -m venv mlxcomfy
+source mlxcomfy/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+```
+
+This installs the usual ComfyUI requirements plus the pinned MLX LTX runtime
+packages needed to load and run the LTX 2.3 MLX model folders on Apple Silicon.
+
+Download a model with `hf download`, or get the folders here. The default
+workflow uses Q4:
+
+```text
+hf download dgrauet/ltx-2.3-mlx-q4 \
+  --local-dir models/checkpoints/ltx-2.3-mlx-q4 \
+  --include config.json split_model.json transformer-distilled.safetensors vae_decoder.safetensors vae_encoder.safetensors audio_vae.safetensors vocoder.safetensors connector.safetensors
+```
+
+Available MLX model repos:
+
+- BF16: [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx)
+- Q8: [dgrauet/ltx-2.3-mlx-q8](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8)
+- Q4: [dgrauet/ltx-2.3-mlx-q4](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4)
+
+Then load:
+
+```text
+docs/workflows/ltx23_mlx_q4_workflow.json
+```
+
+The workflow selects `ltx-2.3-mlx-q4` in `CheckpointLoaderSimple`. The model is
+a folder with multiple MLX files, not a single `.safetensors` checkpoint.
+
+Advanced: `.mlx_ltx.json` checkpoint pointer files are still supported for
+custom local paths or Hugging Face repo-pointer setups.
+
+## Workflow
+
+It uses the regular LTX graph:
+
+```text
+CheckpointLoaderSimple -> CLIPTextEncode -> ModelSamplingLTXV -> SamplerCustomAdvanced -> VAEDecode -> LTXVAudioVAEDecode -> CreateVideo -> SaveVideo
+```
+
+Valid output should be an MP4 with visible frames and generated audio.
+
+## Benchmarks
+
+Setup: M1 Max 64GB, `1024x768 / 121f`, `24fps`, distilled `8+3` steps, seed
+`42`. Time is warm mean end-to-end over 3 runs, including saved MP4 completion.
+
+| Backend | Model | Time | Runs | Output |
+|---|---:|---:|---:|---|
+| MLX | BF16 | 10m 29.38s | 3 | valid MP4 + audio |
+| MLX | Q8 | 8m 15.23s | 3 | valid MP4 + audio |
+| MLX | Q4 | 8m 11.06s | 3 | valid MP4 + audio |
+| PyTorch MPS | BF16 | 30m 33.93s | 3 | valid MP4 + audio |
+
+## Tests
+
+Validated locally with:
+
+```text
+python -m py_compile comfy/ldm/lightricks/mlx.py nodes.py comfy_extras/nodes_custom_sampler.py comfy_extras/nodes_lt.py comfy_extras/nodes_lt_audio.py comfy_extras/nodes_video.py folder_paths.py comfy_api/latest/_input_impl/video_types.py
+python -m pytest tests-unit/comfy_test/mlx_ltx_test.py tests-unit/comfy_test/folder_path_test.py tests-unit/comfy_api_test/video_types_test.py -q
+```
+
+Result: `47 passed, 2 warnings`.
+
+## Acknowledgement
+
+Thanks to [dgrauet](https://github.com/dgrauet/ltx-2-mlx) for the MLX LTX work
+this testing fork builds on.
+
+---
+
+# Original Comfy Repo:
+
+<div align="center">
+
 # ComfyUI
 **The most powerful and modular AI engine for content creation.**
 

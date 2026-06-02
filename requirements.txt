@@ -28,6 +28,10 @@ requests
 simpleeval>=1.0.0
 blake3
 
+# MLX LTX testing fork dependencies.
+ltx-core-mlx @ git+https://github.com/D-Squarius/ltx-2-mlx.git@acddaec5899648c47da375705ea398220e679542#subdirectory=packages/ltx-core-mlx
+ltx-pipelines-mlx @ git+https://github.com/D-Squarius/ltx-2-mlx.git@acddaec5899648c47da375705ea398220e679542#subdirectory=packages/ltx-pipelines-mlx
+
 #non essential dependencies:
 kornia>=0.7.1
 spandrel

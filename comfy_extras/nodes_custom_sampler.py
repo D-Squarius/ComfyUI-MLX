@@ -747,6 +747,15 @@ class SamplerCustom(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image) -> io.NodeOutput:
+        try:
+            from comfy.ldm.lightricks.mlx import is_mlx_ltx_model, run_mlx_ltx_sampling
+
+            if is_mlx_ltx_model(model):
+                out = run_mlx_ltx_sampling(model, positive, negative, latent_image, seed=noise_seed, cfg=cfg)
+                return io.NodeOutput(out, out)
+        except ImportError:
+            pass
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
@@ -950,6 +959,19 @@ class SamplerCustomAdvanced(io.ComfyNode):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image) -> io.NodeOutput:
+        try:
+            from comfy.ldm.lightricks.mlx import is_mlx_ltx_model, run_mlx_ltx_sampling
+
+            model = getattr(guider, "model_patcher", None)
+            if is_mlx_ltx_model(model):
+                positive = getattr(guider, "original_conds", {}).get("positive")
+                negative = getattr(guider, "original_conds", {}).get("negative")
+                cfg = getattr(guider, "cfg", None)
+                out = run_mlx_ltx_sampling(model, positive, negative, latent_image, seed=getattr(noise, "seed", None), cfg=cfg)
+                return io.NodeOutput(out, out)
+        except ImportError:
+            pass
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()

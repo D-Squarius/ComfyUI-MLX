@@ -308,6 +308,21 @@ class VAEDecode:
     SEARCH_ALIASES = ["decode", "decode latent", "latent to image", "render latent"]
 
     def decode(self, vae, samples):
+        try:
+            from comfy.ldm.lightricks.mlx import (
+                is_mlx_ltx_media_latent,
+                make_mlx_ltx_image_proxy,
+                mlx_ltx_media_components,
+                mlx_ltx_media_passthrough_enabled,
+            )
+
+            if is_mlx_ltx_media_latent(samples):
+                if mlx_ltx_media_passthrough_enabled(samples):
+                    return (make_mlx_ltx_image_proxy(samples),)
+                return (mlx_ltx_media_components(samples).images,)
+        except ImportError:
+            pass
+
         latent = samples["samples"]
         if latent.is_nested:
             latent = latent.unbind()[0]
@@ -332,6 +347,21 @@ class VAEDecodeTiled:
     CATEGORY = "experimental"
 
     def decode(self, vae, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
+        try:
+            from comfy.ldm.lightricks.mlx import (
+                is_mlx_ltx_media_latent,
+                make_mlx_ltx_image_proxy,
+                mlx_ltx_media_components,
+                mlx_ltx_media_passthrough_enabled,
+            )
+
+            if is_mlx_ltx_media_latent(samples):
+                if mlx_ltx_media_passthrough_enabled(samples):
+                    return (make_mlx_ltx_image_proxy(samples),)
+                return (mlx_ltx_media_components(samples).images,)
+        except ImportError:
+            pass
+
         if tile_size < overlap * 4:
             overlap = tile_size // 4
         if temporal_size < temporal_overlap * 2:
@@ -587,9 +617,16 @@ class CheckpointLoader:
 class CheckpointLoaderSimple:
     @classmethod
     def INPUT_TYPES(s):
+        checkpoints = folder_paths.get_filename_list("checkpoints")
+        try:
+            from comfy.ldm.lightricks.mlx import list_mlx_ltx_checkpoint_folders
+
+            checkpoints = sorted(set(checkpoints) | set(list_mlx_ltx_checkpoint_folders(folder_paths.get_folder_paths("checkpoints"))))
+        except ImportError:
+            pass
         return {
             "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {"tooltip": "The name of the checkpoint (model) to load."}),
+                "ckpt_name": (checkpoints, {"tooltip": "The name of the checkpoint (model) to load."}),
             }
         }
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
@@ -603,7 +640,21 @@ class CheckpointLoaderSimple:
     SEARCH_ALIASES = ["load model", "checkpoint", "model loader", "load checkpoint", "ckpt", "model"]
 
     def load_checkpoint(self, ckpt_name):
-        ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
+        try:
+            from comfy.ldm.lightricks.mlx import find_mlx_ltx_checkpoint_folder, is_mlx_ltx_manifest_path, load_mlx_ltx_checkpoint
+
+            mlx_ltx_path = ckpt_path
+            if mlx_ltx_path is None:
+                mlx_ltx_path = find_mlx_ltx_checkpoint_folder(ckpt_name, folder_paths.get_folder_paths("checkpoints"))
+            if mlx_ltx_path is not None and is_mlx_ltx_manifest_path(mlx_ltx_path):
+                return load_mlx_ltx_checkpoint(mlx_ltx_path)
+            if mlx_ltx_path is not None and os.path.isdir(mlx_ltx_path):
+                return load_mlx_ltx_checkpoint(mlx_ltx_path)
+        except ImportError:
+            pass
+        if ckpt_path is None:
+            ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
         out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
         return out[:3]
 

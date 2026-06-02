@@ -580,6 +580,14 @@ class ModelSamplingLTXV(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, max_shift, base_shift, latent=None) -> io.NodeOutput:
+        try:
+            from comfy.ldm.lightricks.mlx import is_mlx_ltx_model
+
+            if is_mlx_ltx_model(model):
+                return io.NodeOutput(model)
+        except ImportError:
+            pass
+
         m = model.clone()
 
         if latent is None:
@@ -758,6 +766,21 @@ class LTXVConcatAVLatent(io.ComfyNode):
 
     @classmethod
     def execute(cls, video_latent, audio_latent) -> io.NodeOutput:
+        try:
+            from comfy.ldm.lightricks.mlx import is_mlx_ltx_audio_placeholder, is_mlx_ltx_media_latent
+
+            if is_mlx_ltx_media_latent(video_latent):
+                output = video_latent.copy()
+                output["mlx_ltx_audio_latent"] = audio_latent
+                return io.NodeOutput(output)
+            if is_mlx_ltx_audio_placeholder(audio_latent):
+                output = video_latent.copy()
+                output["mlx_ltx_audio_latent"] = audio_latent
+                output["type"] = "mlx_ltx_video_audio_placeholder"
+                return io.NodeOutput(output)
+        except ImportError:
+            pass
+
         output = {}
         output.update(video_latent)
         output.update(audio_latent)
@@ -794,6 +817,18 @@ class LTXVSeparateAVLatent(io.ComfyNode):
 
     @classmethod
     def execute(cls, av_latent) -> io.NodeOutput:
+        try:
+            from comfy.ldm.lightricks.mlx import is_mlx_ltx_media_latent
+
+            if is_mlx_ltx_media_latent(av_latent):
+                video_latent = av_latent.copy()
+                video_latent["mlx_ltx_media_kind"] = "video"
+                audio_latent = av_latent.copy()
+                audio_latent["mlx_ltx_media_kind"] = "audio"
+                return io.NodeOutput(video_latent, audio_latent)
+        except ImportError:
+            pass
+
         latents = av_latent["samples"].unbind()
         video_latent = av_latent.copy()
         video_latent["samples"] = latents[0]
