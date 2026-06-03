@@ -24,7 +24,18 @@ The validated LTX 2.3 MLX model sources are:
 Example Q4 download:
 
 ```text
-huggingface-cli download dgrauet/ltx-2.3-mlx-q4 --local-dir models/checkpoints/ltx-2.3-mlx-q4
+hf download dgrauet/ltx-2.3-mlx-q4 \
+  --local-dir models/checkpoints/ltx-2.3-mlx-q4 \
+  --include config.json split_model.json transformer-distilled.safetensors vae_decoder.safetensors vae_encoder.safetensors audio_vae.safetensors vocoder.safetensors connector.safetensors spatial_upscaler_x2_v1_1.safetensors spatial_upscaler_x2_v1_1_config.json
+```
+
+If you already downloaded the earlier incomplete Q4 folder, fetch just the
+missing upscaler files:
+
+```text
+hf download dgrauet/ltx-2.3-mlx-q4 \
+  --local-dir models/checkpoints/ltx-2.3-mlx-q4 \
+  --include spatial_upscaler_x2_v1_1.safetensors spatial_upscaler_x2_v1_1_config.json
 ```
 
 Select `ltx-2.3-mlx-q4` in `CheckpointLoaderSimple`. The model is a folder with

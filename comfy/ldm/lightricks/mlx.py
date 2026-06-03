@@ -26,6 +26,8 @@ MLX_LTX_REQUIRED_MODEL_FILES = frozenset(
         "audio_vae.safetensors",
         "vocoder.safetensors",
         "connector.safetensors",
+        "spatial_upscaler_x2_v1_1.safetensors",
+        "spatial_upscaler_x2_v1_1_config.json",
     }
 )
 
