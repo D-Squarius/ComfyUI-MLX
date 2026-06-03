@@ -29,8 +29,8 @@ simpleeval>=1.0.0
 blake3
 
 # MLX LTX testing fork dependencies.
-ltx-core-mlx @ git+https://github.com/D-Squarius/ltx-2-mlx.git@12b1af6a5f80e9fd12c0b262a80bd1c4fffb68fd#subdirectory=packages/ltx-core-mlx
-ltx-pipelines-mlx @ git+https://github.com/D-Squarius/ltx-2-mlx.git@12b1af6a5f80e9fd12c0b262a80bd1c4fffb68fd#subdirectory=packages/ltx-pipelines-mlx
+ltx-core-mlx @ git+https://github.com/D-Squarius/ltx-2-mlx.git@2a24bc2768d58fc57bb55e21dff8340cd70d7f1c#subdirectory=packages/ltx-core-mlx
+ltx-pipelines-mlx @ git+https://github.com/D-Squarius/ltx-2-mlx.git@2a24bc2768d58fc57bb55e21dff8340cd70d7f1c#subdirectory=packages/ltx-pipelines-mlx
 
 #non essential dependencies:
 kornia>=0.7.1
