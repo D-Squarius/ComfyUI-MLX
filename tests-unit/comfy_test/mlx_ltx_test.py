@@ -108,6 +108,16 @@ def test_mlx_ltx_model_directory_rejects_missing_spatial_upscaler(tmp_path):
     assert find_mlx_ltx_checkpoint_folder("ltx-2.3-mlx-q4", [str(tmp_path)]) is None
 
 
+def test_mlx_ltx_model_directory_rejects_older_unversioned_distilled_transformer(tmp_path):
+    model_dir = write_fake_mlx_ltx_model_dir(tmp_path / "ltx-2.3-mlx-q4")
+    (model_dir / "transformer-distilled-1.1.safetensors").unlink()
+    (model_dir / "transformer-distilled.safetensors").write_text("{}", encoding="utf-8")
+
+    assert not is_mlx_ltx_model_dir(model_dir)
+    assert list_mlx_ltx_checkpoint_folders([str(tmp_path)]) == []
+    assert find_mlx_ltx_checkpoint_folder("ltx-2.3-mlx-q4", [str(tmp_path)]) is None
+
+
 def test_mlx_ltx_resolve_hf_snapshot_uses_spec_controls(monkeypatch):
     calls = {}
     fake_hub = types.ModuleType("huggingface_hub")

@@ -20,7 +20,7 @@ MLX_LTX_REQUIRED_MODEL_FILES = frozenset(
     {
         "config.json",
         "split_model.json",
-        "transformer-distilled.safetensors",
+        "transformer-distilled-1.1.safetensors",
         "vae_decoder.safetensors",
         "vae_encoder.safetensors",
         "audio_vae.safetensors",

@@ -33,22 +33,38 @@ python -m pip install -r requirements.txt
 This installs the usual ComfyUI requirements plus the pinned MLX LTX runtime
 packages needed to load and run the LTX 2.3 MLX model folders on Apple Silicon.
 
-Download a model with `hf download`, or get the folders here. The default
-workflow uses Q4:
+Download one of the MLX model folders with `hf download`, or get the folders
+from Hugging Face. The default workflow uses Q4:
 
 ```text
 hf download dgrauet/ltx-2.3-mlx-q4 \
   --local-dir models/checkpoints/ltx-2.3-mlx-q4 \
-  --include config.json split_model.json transformer-distilled.safetensors vae_decoder.safetensors vae_encoder.safetensors audio_vae.safetensors vocoder.safetensors connector.safetensors spatial_upscaler_x2_v1_1.safetensors spatial_upscaler_x2_v1_1_config.json
+  --include config.json split_model.json transformer-distilled-1.1.safetensors vae_decoder.safetensors vae_encoder.safetensors audio_vae.safetensors vocoder.safetensors connector.safetensors spatial_upscaler_x2_v1_1.safetensors spatial_upscaler_x2_v1_1_config.json
 ```
 
-If you already downloaded the earlier incomplete Q4 folder, fetch just the
-missing upscaler files:
+Q8:
+
+```text
+hf download dgrauet/ltx-2.3-mlx-q8 \
+  --local-dir models/checkpoints/ltx-2.3-mlx-q8 \
+  --include config.json split_model.json transformer-distilled-1.1.safetensors vae_decoder.safetensors vae_encoder.safetensors audio_vae.safetensors vocoder.safetensors connector.safetensors spatial_upscaler_x2_v1_1.safetensors spatial_upscaler_x2_v1_1_config.json
+```
+
+BF16:
+
+```text
+hf download dgrauet/ltx-2.3-mlx \
+  --local-dir models/checkpoints/ltx-2.3-mlx \
+  --include config.json split_model.json transformer-distilled-1.1.safetensors vae_decoder.safetensors vae_encoder.safetensors audio_vae.safetensors vocoder.safetensors connector.safetensors spatial_upscaler_x2_v1_1.safetensors spatial_upscaler_x2_v1_1_config.json
+```
+
+If you already downloaded an older folder, fetch the newer 1.1 transformer.
+This is the Q4 repair command; use the matching repo and folder for Q8 or BF16:
 
 ```text
 hf download dgrauet/ltx-2.3-mlx-q4 \
   --local-dir models/checkpoints/ltx-2.3-mlx-q4 \
-  --include spatial_upscaler_x2_v1_1.safetensors spatial_upscaler_x2_v1_1_config.json
+  --include transformer-distilled-1.1.safetensors
 ```
 
 Available MLX model repos:
