@@ -79,6 +79,24 @@ The separate native T2V timing pass for LTX dev+LoRA is:
 
 It measured `ComfyUI-MLX LTX 2.3 BF16 dev+LoRA native T2V workflow` at `1280x768 / 121f / 24fps` with a scored average of `948.32s`. Historical distilled-package rows at `1024x768 / 120f` measured about `629-648s`; those are useful context but are not strict apples-to-apples with the native dev+LoRA 1280x768 workflow.
 
+### Historical LTX Distilled Context
+
+The committed distilled workflow examples are:
+
+- `docs/workflows/ltx23_mlx_q4_native_island_t2v.json`
+- `docs/workflows/ltx23_mlx_q4_native_island_i2v.json`
+
+Those examples use the distilled MLX package layout. The Q8 and BF16 distilled packages use the same folder layout from their linked model repos.
+
+Older local distilled-package benchmark artifacts are useful context for the faster LTX path, but they are not the same as native dev+LoRA BF16 validation.
+
+| Context row | Settings | MLX BF16 | MLX Q8 | MLX Q4 | Notes |
+|---|---:|---:|---:|---:|---|
+| Distilled T2V package | 1024x768 / about 5s | 647.74s avg | 506.19s avg | 498.39s avg | Valid MP4/audio; Q8/Q4 were roughly 46-47% lower wall time than the current native dev+LoRA 720p row |
+| Distilled quant final table | 512x512 / 49f context | 120.15s avg | 87.28s avg | 75.22s avg | Valid MP4/audio; compared locally against older split-file MPS context rows |
+
+Keep these rows labeled as historical context. They support documenting the faster distilled LTX path, but they should not be mixed into strict native dev+LoRA BF16 apples-to-apples claims.
+
 ## Runtime Validation Contract
 
 A passing MLX row must prove all of the following:

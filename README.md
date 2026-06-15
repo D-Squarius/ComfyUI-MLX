@@ -75,7 +75,15 @@ Current local validation summary:
 | LTX 2.3 BF16 dev+LoRA First-Last | 512x512 / 49f | 281.09s | Valid MP4/audio, sparse guide attention |
 | LTX 2.3 BF16 dev+LoRA T2V | 1280x768 / 121f | 929.56s | Valid MP4/audio, MLX route proof |
 
-Historical LTX distilled-package runs measured faster in local context, but they are reported separately from native BF16 dev+LoRA workflow validation because settings and workflow path differ. Raw benchmark harnesses and generated result folders remain local development artifacts.
+Historical LTX distilled-package context rows:
+
+| Row | Resolution | Scored time | Validation |
+|---|---:|---:|---|
+| LTX 2.3 distilled MLX BF16 context | 1024x768 / about 5s | 647.74s avg | Valid MP4/audio; context only |
+| LTX 2.3 distilled MLX Q8 context | 1024x768 / about 5s | 506.19s avg | Valid MP4/audio; context only |
+| LTX 2.3 distilled MLX Q4 context | 1024x768 / about 5s | 498.39s avg | Valid MP4/audio; context only |
+
+The historical distilled Q8/Q4 context rows were roughly 46-47% lower wall time than the current `1280x768 / 121f` native dev+LoRA BF16 T2V row. They are reported separately because model path, resolution, and workflow path differ. Distilled workflow examples are committed in `docs/workflows/ltx23_mlx_q4_native_island_t2v.json` and `docs/workflows/ltx23_mlx_q4_native_island_i2v.json`; Q8 and BF16 distilled packages use the same folder layout from their linked model repos. Raw benchmark harnesses and generated result folders remain local development artifacts.
 
 ## Limitations
 
