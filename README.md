@@ -75,9 +75,7 @@ Current local validation summary:
 | LTX 2.3 BF16 dev+LoRA First-Last | 512x512 / 49f | 281.09s | Valid MP4/audio, sparse guide attention |
 | LTX 2.3 BF16 dev+LoRA T2V | 1280x768 / 121f | 929.56s | Valid MP4/audio, MLX route proof |
 
-Historical LTX distilled-package runs measured faster in local context, but they are reported separately from native BF16 dev+LoRA workflow validation because settings and workflow path differ.
-
-The current review package is [docs/fork_review_package_20260615.md](docs/fork_review_package_20260615.md). Raw benchmark harnesses and generated result folders are local development artifacts and are not part of the first public push plan.
+Historical LTX distilled-package runs measured faster in local context, but they are reported separately from native BF16 dev+LoRA workflow validation because settings and workflow path differ. Raw benchmark harnesses and generated result folders remain local development artifacts.
 
 ## Limitations
 
