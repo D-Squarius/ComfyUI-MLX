@@ -62,6 +62,8 @@ Keep dense Comfy weights in the normal Comfy model folders. Keep MLX packages or
 
 More detail is in [docs/mlx_native_workflows.md](docs/mlx_native_workflows.md).
 
+For LTX specifically, `dev` and `distilled` are separate paths. The native dev+LoRA BF16 path runs the transformer through MLX, but its dev transformer source is the stock BF16 `ltx-2.3-22b-dev.safetensors` loaded into MLX arrays and merged with the distilled LoRA. The distilled BF16/Q8/Q4 paths use the prepackaged MLX distilled folders with `transformer-distilled-1.1.safetensors`.
+
 ## Current Benchmark Evidence
 
 Current local validation summary:

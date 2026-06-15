@@ -94,6 +94,8 @@ For LTX there are two distinct MLX paths:
 - Native dev+LoRA BF16: use the `dgrauet/ltx-2.3-mlx` MLX package root together with the stock BF16 dev checkpoint `ltx-2.3-22b-dev.safetensors` and the local distilled LoRA at strength `0.5`.
 - Distilled MLX package: use one of `dgrauet/ltx-2.3-mlx`, `dgrauet/ltx-2.3-mlx-q8`, or `dgrauet/ltx-2.3-mlx-q4`, where the package folder contains `transformer-distilled-1.1.safetensors` and the companion media files.
 
+In other words, `MLX native dev+LoRA BF16` means MLX execution with the stock BF16 dev safetensor loaded into MLX arrays, not a separate preconverted dev transformer package. `MLX distilled BF16/Q8/Q4` means the distilled transformer comes directly from the MLX package folder.
+
 Older local distilled-package benchmark artifacts are useful context for the faster LTX path, but they are not the same as native dev+LoRA BF16 validation.
 
 | Context row | Settings | MLX BF16 | MLX Q8 | MLX Q4 | Notes |
