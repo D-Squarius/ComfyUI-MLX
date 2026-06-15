@@ -9,8 +9,10 @@ if TYPE_CHECKING:
 import torch
 from functools import partial
 import collections
+import json
 import math
 import logging
+import time
 import comfy.sampler_helpers
 import comfy.model_patcher
 import comfy.patcher_extension
@@ -19,6 +21,292 @@ import comfy.context_windows
 import comfy.utils
 import scipy.stats
 import numpy
+
+
+_LTX_SAMPLER_TRACE_KEY = "ltx_sampler_finite_trace"
+_LTX_SAMPLER_TRACE_STOP_REASON = "LTX_SAMPLER_FINITE_TRACE_STOP"
+_LTX_SAMPLER_TRACE_STATES = {}
+
+
+def _ltx_sampler_trace_config(model_options):
+    if model_options is None:
+        return None
+    config = model_options.get(_LTX_SAMPLER_TRACE_KEY)
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return None
+    if not config.get("event_path"):
+        return None
+    return config
+
+
+def _ltx_sampler_trace_state(config):
+    path = config["event_path"]
+    state = _LTX_SAMPLER_TRACE_STATES.get(path)
+    if state is None:
+        state = {
+            "event_count": 0,
+            "model_call_count": 0,
+            "current_model_call": None,
+            "stopped": False,
+        }
+        _LTX_SAMPLER_TRACE_STATES[path] = state
+    return state
+
+
+def _ltx_sampler_trace_parse_filter(value):
+    value = str(value or "").strip().lower()
+    if not value or value in {"all", "full", "*"}:
+        return None
+    selected = set()
+    for item in value.replace(",", " ").split():
+        if "-" in item:
+            start_text, _, end_text = item.partition("-")
+            if start_text.isdigit() and end_text.isdigit():
+                start, end = int(start_text), int(end_text)
+                if end < start:
+                    start, end = end, start
+                selected.update(range(start, end + 1))
+                continue
+        if item.isdigit():
+            selected.add(int(item))
+    return selected
+
+
+def _ltx_sampler_trace_value_selected(value, selector):
+    selected = _ltx_sampler_trace_parse_filter(selector)
+    return selected is None or int(value) in selected
+
+
+def _ltx_sampler_trace_stage_selected(stage, selector):
+    selector = str(selector or "").strip().lower()
+    if not selector or selector in {"all", "full", "*"}:
+        return True
+    stage = str(stage or "").strip().lower()
+    selected = {item.strip() for item in selector.replace(",", " ").split() if item.strip()}
+    return stage in selected
+
+
+def _ltx_sampler_trace_current_model_call(model_options):
+    config = _ltx_sampler_trace_config(model_options)
+    if config is None:
+        return None
+    return _ltx_sampler_trace_state(config).get("current_model_call")
+
+
+def _ltx_sampler_trace_should_trace_block(model_options, block_index, stage):
+    config = _ltx_sampler_trace_config(model_options)
+    if config is None or config.get("mode") not in {"block_stage_trace", "sync_isolation_trace"}:
+        return False
+    current_call = _ltx_sampler_trace_current_model_call(model_options)
+    if current_call is None:
+        return False
+    if not _ltx_sampler_trace_value_selected(current_call, config.get("trace_model_calls", "1")):
+        return False
+    if not _ltx_sampler_trace_value_selected(block_index, config.get("trace_blocks", "29")):
+        return False
+    return _ltx_sampler_trace_stage_selected(stage, config.get("trace_block_stages", "all"))
+
+
+def _ltx_sampler_trace_should_use_workaround(model_options, block_index, stage, workaround_name):
+    config = _ltx_sampler_trace_config(model_options)
+    if config is None:
+        return False
+    if str(config.get("nan_workaround") or "none").strip().lower() != workaround_name:
+        return False
+    current_call = _ltx_sampler_trace_current_model_call(model_options)
+    if current_call is None:
+        return False
+    if not _ltx_sampler_trace_value_selected(current_call, config.get("trace_model_calls", "all")):
+        return False
+    if not _ltx_sampler_trace_value_selected(block_index, config.get("trace_blocks", "all")):
+        return False
+    return _ltx_sampler_trace_stage_selected(stage, config.get("trace_block_stages", "all"))
+
+
+def _ltx_sampler_trace_event_stage(metadata):
+    metadata = metadata or {}
+    stage = metadata.get("stage")
+    attention = metadata.get("attention")
+    if attention and stage:
+        return f"{attention}.{stage}"
+    return stage
+
+
+def _ltx_sampler_trace_event_policy(config, model_options, metadata):
+    if config is None or config.get("mode") != "sync_isolation_trace":
+        return "cpu_copy_summary"
+    metadata = metadata or {}
+    block_index = metadata.get("block_index")
+    stage = _ltx_sampler_trace_event_stage(metadata)
+    if block_index is None or stage is None:
+        return "cpu_copy_summary"
+    if not _ltx_sampler_trace_should_trace_block(model_options, block_index, stage):
+        return "cpu_copy_summary"
+    action = str(config.get("sync_isolation_action") or "log_only").strip().lower()
+    if action in {"sync_only", "device_finite_only", "cpu_copy_summary"}:
+        return action
+    return "shape_only"
+
+
+def _ltx_sampler_trace_tensor_summary(value, policy="cpu_copy_summary"):
+    if torch.is_tensor(value):
+        summary = {
+            "type": "tensor",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "requires_grad": bool(value.requires_grad),
+            "summary_policy": policy,
+        }
+        if policy == "shape_only":
+            return summary
+        try:
+            raw = value.detach()
+            try:
+                device_finite = torch.isfinite(raw)
+                summary.update({
+                    "device_finite_count": int(device_finite.sum().item()),
+                    "device_nonfinite_count": int((~device_finite).sum().item()),
+                    "device_nan_count": int(torch.isnan(raw).sum().item()),
+                    "device_inf_count": int(torch.isinf(raw).sum().item()),
+                })
+            except Exception as exc:
+                summary.update({
+                    "device_finite_status": "error",
+                    "device_finite_error": str(exc),
+                })
+            if policy == "device_finite_only":
+                try:
+                    summary["numel"] = int(raw.numel())
+                    summary["all_finite"] = bool(int(summary.get("device_nonfinite_count") or 0) == 0)
+                except Exception:
+                    pass
+                return summary
+            cpu = raw.float().cpu()
+            finite = torch.isfinite(cpu)
+            finite_count = int(finite.sum().item())
+            numel = int(cpu.numel())
+            summary.update({
+                "numel": numel,
+                "finite_count": finite_count,
+                "nonfinite_count": int((~finite).sum().item()),
+                "nan_count": int(torch.isnan(cpu).sum().item()),
+                "inf_count": int(torch.isinf(cpu).sum().item()),
+                "all_finite": bool(finite_count == numel),
+            })
+            if finite_count > 0:
+                finite_values = cpu[finite]
+                summary.update({
+                    "finite_min": float(finite_values.min().item()),
+                    "finite_max": float(finite_values.max().item()),
+                    "finite_mean": float(finite_values.mean().item()),
+                })
+            else:
+                summary.update({
+                    "finite_min": None,
+                    "finite_max": None,
+                    "finite_mean": None,
+                })
+        except Exception as exc:
+            summary.update({
+                "status": "finite_summary_error",
+                "error": str(exc),
+            })
+        return summary
+    if isinstance(value, (tuple, list)):
+        return [_ltx_sampler_trace_tensor_summary(item, policy) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _ltx_sampler_trace_tensor_summary(item, policy) for key, item in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return {"type": type(value).__name__}
+
+
+def _ltx_sampler_trace_find_nonfinite(summary, prefix=""):
+    if isinstance(summary, dict) and "nonfinite_count" in summary:
+        cpu_nonfinite = int(summary.get("nonfinite_count") or 0)
+        device_nonfinite = int(summary.get("device_nonfinite_count") or 0)
+        if cpu_nonfinite or device_nonfinite:
+            return {
+                "path": prefix or "tensor",
+                "nonfinite_count": cpu_nonfinite,
+                "device_nonfinite_count": device_nonfinite,
+                "nan_count": int(summary.get("nan_count") or 0),
+                "device_nan_count": int(summary.get("device_nan_count") or 0),
+                "inf_count": int(summary.get("inf_count") or 0),
+                "device_inf_count": int(summary.get("device_inf_count") or 0),
+                "shape": summary.get("shape"),
+                "dtype": summary.get("dtype"),
+                "device": summary.get("device"),
+            }
+        return None
+    if isinstance(summary, list):
+        for i, item in enumerate(summary):
+            found = _ltx_sampler_trace_find_nonfinite(item, f"{prefix}[{i}]" if prefix else f"[{i}]")
+            if found is not None:
+                return found
+    if isinstance(summary, dict):
+        for key, item in summary.items():
+            found = _ltx_sampler_trace_find_nonfinite(item, f"{prefix}.{key}" if prefix else str(key))
+            if found is not None:
+                return found
+    return None
+
+
+def _ltx_sampler_trace_append(path, event):
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    except Exception as exc:
+        logging.warning("LTX sampler finite trace failed to write %s: %s", path, exc)
+
+
+def _ltx_sampler_trace_event(model_options, boundary, tensors=None, metadata=None, model_call_start=False):
+    config = _ltx_sampler_trace_config(model_options)
+    if config is None:
+        return
+    state = _ltx_sampler_trace_state(config)
+    if state.get("stopped"):
+        raise RuntimeError(_LTX_SAMPLER_TRACE_STOP_REASON)
+
+    if model_call_start:
+        state["current_model_call"] = state["model_call_count"]
+        state["model_call_count"] += 1
+
+    policy = _ltx_sampler_trace_event_policy(config, model_options, metadata)
+    sync_isolation_action = str(config.get("sync_isolation_action") or "").strip().lower()
+    if policy == "sync_only" and torch.backends.mps.is_available():
+        torch.mps.synchronize()
+        policy = "shape_only"
+    summaries = _ltx_sampler_trace_tensor_summary(tensors or {}, policy)
+    first_nonfinite = _ltx_sampler_trace_find_nonfinite(summaries, "tensors")
+    max_model_calls = int(config.get("max_model_calls") or 0)
+    max_reached = bool(max_model_calls > 0 and state["model_call_count"] >= max_model_calls and boundary.endswith(".end"))
+    stop = bool(first_nonfinite is not None or max_reached)
+    event = {
+        "event_type": "ltx_sampler_finite_trace",
+        "boundary": boundary,
+        "event_index": state["event_count"],
+        "model_call_index": state.get("current_model_call"),
+        "model_call_count": state["model_call_count"],
+        "timestamp": time.time(),
+        "metadata": metadata or {},
+        "tensors": summaries,
+        "first_nonfinite": first_nonfinite,
+        "diagnostic_stop": stop,
+        "summary_policy": policy,
+    }
+    if config.get("mode") == "sync_isolation_trace":
+        event["sync_isolation_action"] = sync_isolation_action or "log_only"
+    if stop:
+        event["diagnostic_stop_reason"] = _LTX_SAMPLER_TRACE_STOP_REASON
+        if max_reached and first_nonfinite is None:
+            event["stop_detail"] = "max_model_calls_reached"
+    _ltx_sampler_trace_append(config["event_path"], event)
+    state["event_count"] += 1
+    if stop:
+        state["stopped"] = True
+        raise RuntimeError(_LTX_SAMPLER_TRACE_STOP_REASON)
 
 
 def add_area_dims(area, num_dims):
@@ -213,6 +501,12 @@ def _calc_cond_batch_outer(model: BaseModel, conds: list[list[dict]], x_in: torc
     return executor.execute(model, conds, x_in, timestep, model_options)
 
 def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tensor, timestep, model_options):
+    _ltx_sampler_trace_event(
+        model_options,
+        "calc_cond_batch.start",
+        {"x_in": x_in, "timestep": timestep},
+        {"cond_count": len(conds)},
+    )
     out_conds = []
     out_counts = []
     # separate conds by matching hooks
@@ -302,6 +596,8 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
                 transformer_options = comfy.patcher_extension.merge_nested_dicts(transformer_options,
                                                                                  model_options['transformer_options'],
                                                                                  copy_dict1=False)
+            if _LTX_SAMPLER_TRACE_KEY in model_options:
+                transformer_options[_LTX_SAMPLER_TRACE_KEY] = model_options[_LTX_SAMPLER_TRACE_KEY]
 
             if patches is not None:
                 transformer_options["patches"] = comfy.patcher_extension.merge_nested_dicts(
@@ -319,9 +615,23 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
                 c['control'] = control.get_control(input_x, timestep_, c, len(cond_or_uncond), transformer_options)
 
             if 'model_function_wrapper' in model_options:
-                output = model_options['model_function_wrapper'](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
+                output = model_options['model_function_wrapper'](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond, "cond_scale": model_options.get("current_cfg_scale", None)}).chunk(batch_chunks)
             else:
-                output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
+                raw_output = model.apply_model(input_x, timestep_, **c)
+                _ltx_sampler_trace_event(
+                    model_options,
+                    "calc_cond_batch.apply_model_output",
+                    {"input_x": input_x, "timestep": timestep_, "raw_output": raw_output},
+                    {"batch_chunks": batch_chunks, "cond_or_uncond": cond_or_uncond[:]},
+                )
+                output = raw_output.chunk(batch_chunks)
+
+            _ltx_sampler_trace_event(
+                model_options,
+                "calc_cond_batch.output_chunks",
+                {"chunks": output},
+                {"batch_chunks": batch_chunks, "cond_or_uncond": cond_or_uncond[:]},
+            )
 
             for o in range(batch_chunks):
                 cond_index = cond_or_uncond[o]
@@ -342,6 +652,12 @@ def _calc_cond_batch(model: BaseModel, conds: list[list[dict]], x_in: torch.Tens
     for i in range(len(out_conds)):
         out_conds[i] /= out_counts[i]
 
+    _ltx_sampler_trace_event(
+        model_options,
+        "calc_cond_batch.end",
+        {"out_conds": out_conds, "out_counts": out_counts},
+        {"cond_count": len(conds)},
+    )
     return out_conds
 
 def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options): #TODO: remove
@@ -349,6 +665,12 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options): 
     return tuple(calc_cond_batch(model, [cond, uncond], x_in, timestep, model_options))
 
 def cfg_function(model, cond_pred, uncond_pred, cond_scale, x, timestep, model_options={}, cond=None, uncond=None):
+    _ltx_sampler_trace_event(
+        model_options,
+        "cfg_function.start",
+        {"x": x, "cond_pred": cond_pred, "uncond_pred": uncond_pred, "timestep": timestep},
+        {"cond_scale": float(cond_scale) if isinstance(cond_scale, (float, int)) else str(cond_scale)},
+    )
     if "sampler_cfg_function" in model_options:
         args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep,
                 "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options, "input_cond": cond, "input_uncond": uncond}
@@ -361,11 +683,26 @@ def cfg_function(model, cond_pred, uncond_pred, cond_scale, x, timestep, model_o
                 "sigma": timestep, "model_options": model_options, "input": x}
         cfg_result = fn(args)
 
+    _ltx_sampler_trace_event(
+        model_options,
+        "cfg_function.end",
+        {"x": x, "cond_pred": cond_pred, "uncond_pred": uncond_pred, "cfg_result": cfg_result, "timestep": timestep},
+        {"cond_scale": float(cond_scale) if isinstance(cond_scale, (float, int)) else str(cond_scale)},
+    )
     return cfg_result
 
 #The main sampling function shared by all the samplers
 #Returns denoised
 def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
+    model_options = dict(model_options)
+    model_options["current_cfg_scale"] = cond_scale
+    _ltx_sampler_trace_event(
+        model_options,
+        "sampling_function.start",
+        {"x": x, "timestep": timestep},
+        {"cond_scale": float(cond_scale) if isinstance(cond_scale, (float, int)) else str(cond_scale), "seed": seed},
+        model_call_start=True,
+    )
     if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
         uncond_ = None
     else:
@@ -383,7 +720,20 @@ def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_option
                 "input": x, "sigma": timestep, "model": model, "model_options": model_options}
         out = fn(args)
 
-    return cfg_function(model, out[0], out[1], cond_scale, x, timestep, model_options=model_options, cond=cond, uncond=uncond_)
+    _ltx_sampler_trace_event(
+        model_options,
+        "sampling_function.cond_predictions",
+        {"x": x, "timestep": timestep, "cond_pred": out[0], "uncond_pred": out[1]},
+        {"cond_scale": float(cond_scale) if isinstance(cond_scale, (float, int)) else str(cond_scale)},
+    )
+    result = cfg_function(model, out[0], out[1], cond_scale, x, timestep, model_options=model_options, cond=cond, uncond=uncond_)
+    _ltx_sampler_trace_event(
+        model_options,
+        "sampling_function.end",
+        {"x": x, "timestep": timestep, "denoised": result},
+        {"cond_scale": float(cond_scale) if isinstance(cond_scale, (float, int)) else str(cond_scale)},
+    )
+    return result
 
 
 class KSamplerX0Inpaint:
@@ -732,6 +1082,13 @@ class KSAMPLER(Sampler):
 
     def sample(self, model_wrap, sigmas, extra_args, callback, noise, latent_image=None, denoise_mask=None, disable_pbar=False):
         extra_args["denoise_mask"] = denoise_mask
+        model_options = extra_args.get("model_options", {})
+        _ltx_sampler_trace_event(
+            model_options,
+            "ksampler.sample.start",
+            {"noise": noise, "latent_image": latent_image, "sigmas": sigmas, "denoise_mask": denoise_mask},
+            {"sampler_function": getattr(self.sampler_function, "__name__", type(self.sampler_function).__name__)},
+        )
         model_k = KSamplerX0Inpaint(model_wrap, sigmas)
         model_k.latent_image = latent_image
         if self.inpaint_options.get("random", False): #TODO: Should this be the default?
@@ -741,14 +1098,42 @@ class KSAMPLER(Sampler):
             model_k.noise = noise
 
         noise = model_wrap.inner_model.model_sampling.noise_scaling(sigmas[0], noise, latent_image, self.max_denoise(model_wrap, sigmas))
+        _ltx_sampler_trace_event(
+            model_options,
+            "ksampler.sample.scaled_noise",
+            {"noise": noise, "latent_image": latent_image, "sigmas": sigmas},
+        )
 
         k_callback = None
         total_steps = len(sigmas) - 1
         if callback is not None:
-            k_callback = lambda x: callback(x["i"], x["denoised"], x["x"], total_steps)
+            def k_callback(x):
+                i = int(x.get("i", -1))
+                _ltx_sampler_trace_event(
+                    model_options,
+                    "ksampler.callback",
+                    {"denoised": x.get("denoised"), "x": x.get("x")},
+                    {
+                        "step": i,
+                        "total_steps": total_steps,
+                        "sigma": float(sigmas[i].detach().cpu().item()) if 0 <= i < len(sigmas) else None,
+                        "next_sigma": float(sigmas[i + 1].detach().cpu().item()) if 0 <= i + 1 < len(sigmas) else None,
+                    },
+                )
+                callback(x["i"], x["denoised"], x["x"], total_steps)
 
         samples = self.sampler_function(model_k, noise, sigmas, extra_args=extra_args, callback=k_callback, disable=disable_pbar, **self.extra_options)
+        _ltx_sampler_trace_event(
+            model_options,
+            "ksampler.sample.samples_before_inverse",
+            {"samples": samples},
+        )
         samples = model_wrap.inner_model.model_sampling.inverse_noise_scaling(sigmas[-1], samples)
+        _ltx_sampler_trace_event(
+            model_options,
+            "ksampler.sample.end",
+            {"samples": samples},
+        )
         return samples
 
 
@@ -963,14 +1348,38 @@ class CFGGuider:
         return sampling_function(self.inner_model, x, timestep, self.conds.get("negative", None), self.conds.get("positive", None), self.cfg, model_options=model_options, seed=seed)
 
     def inner_sample(self, noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=None):
+        _ltx_sampler_trace_event(
+            self.model_options,
+            "cfg_guider.inner_sample.start",
+            {"noise": noise, "latent_image": latent_image, "sigmas": sigmas, "denoise_mask": denoise_mask},
+            {"seed": seed, "device": str(device)},
+        )
         if latent_image is not None and torch.count_nonzero(latent_image) > 0: #Don't shift the empty latent image.
             latent_image = self.inner_model.process_latent_in(latent_image)
+            _ltx_sampler_trace_event(
+                self.model_options,
+                "cfg_guider.inner_sample.after_process_latent_in",
+                {"latent_image": latent_image},
+                {"seed": seed, "device": str(device)},
+            )
 
         self.conds = process_conds(self.inner_model, noise, self.conds, device, latent_image, denoise_mask, seed, latent_shapes=latent_shapes)
+        _ltx_sampler_trace_event(
+            self.model_options,
+            "cfg_guider.inner_sample.after_process_conds",
+            {"noise": noise, "latent_image": latent_image, "conds": self.conds},
+            {"seed": seed, "device": str(device)},
+        )
 
         extra_model_options = comfy.model_patcher.create_model_options_clone(self.model_options)
         extra_model_options.setdefault("transformer_options", {})["sample_sigmas"] = sigmas
         extra_args = {"model_options": extra_model_options, "seed": seed}
+        _ltx_sampler_trace_event(
+            extra_model_options,
+            "cfg_guider.inner_sample.before_sampler",
+            {"noise": noise, "latent_image": latent_image, "sigmas": sigmas, "denoise_mask": denoise_mask},
+            {"seed": seed, "device": str(device)},
+        )
 
         executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(
             sampler.sample,
@@ -978,7 +1387,20 @@ class CFGGuider:
             comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE, extra_args["model_options"], is_model_options=True)
         )
         samples = executor.execute(self, sigmas, extra_args, callback, noise, latent_image, denoise_mask, disable_pbar)
-        return self.inner_model.process_latent_out(samples.to(torch.float32))
+        _ltx_sampler_trace_event(
+            extra_model_options,
+            "cfg_guider.inner_sample.after_sampler",
+            {"samples": samples},
+            {"seed": seed, "device": str(device)},
+        )
+        out = self.inner_model.process_latent_out(samples.to(torch.float32))
+        _ltx_sampler_trace_event(
+            extra_model_options,
+            "cfg_guider.inner_sample.end",
+            {"samples": samples, "processed_out": out},
+            {"seed": seed, "device": str(device)},
+        )
+        return out
 
     def outer_sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None, disable_pbar=False, seed=None, latent_shapes=None):
         self.inner_model, self.conds, self.loaded_models = comfy.sampler_helpers.prepare_sampling(self.model_patcher, noise.shape, self.conds, self.model_options)
@@ -987,6 +1409,12 @@ class CFGGuider:
         noise = noise.to(device=device, dtype=torch.float32)
         latent_image = latent_image.to(device=device, dtype=torch.float32)
         sigmas = sigmas.to(device)
+        _ltx_sampler_trace_event(
+            self.model_options,
+            "cfg_guider.outer_sample.prepared_inputs",
+            {"noise": noise, "latent_image": latent_image, "sigmas": sigmas, "denoise_mask": denoise_mask},
+            {"seed": seed, "device": str(device)},
+        )
         cast_to_load_options(self.model_options, device=device, dtype=self.model_patcher.model_dtype())
 
         try:

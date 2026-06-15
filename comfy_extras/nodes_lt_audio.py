@@ -9,6 +9,13 @@ from comfy_extras.nodes_audio import VAEEncodeAudio
 class LTXVAudioVAELoader(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
+        ckpt_names = folder_paths.get_filename_list("checkpoints")
+        try:
+            from comfy.backends.mlx_ltx_backend import MLX_LTX_AUDIO_VAE_ALIASES, list_mlx_ltx_checkpoint_choices
+
+            ckpt_names = sorted(set(ckpt_names).union(list_mlx_ltx_checkpoint_choices(aliases=False)).union(MLX_LTX_AUDIO_VAE_ALIASES))
+        except ImportError:
+            pass
         return io.Schema(
             node_id="LTXVAudioVAELoader",
             display_name="Load LTXV Audio VAE",
@@ -16,7 +23,7 @@ class LTXVAudioVAELoader(io.ComfyNode):
             inputs=[
                 io.Combo.Input(
                     "ckpt_name",
-                    options=folder_paths.get_filename_list("checkpoints"),
+                    options=ckpt_names,
                     tooltip="Audio VAE checkpoint to load.",
                 )
             ],
@@ -25,6 +32,15 @@ class LTXVAudioVAELoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, ckpt_name: str) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import MLX_LTX_AUDIO_VAE_ALIASES, load_mlx_ltx_checkpoint, resolve_mlx_ltx_checkpoint_path
+
+            ckpt_path = resolve_mlx_ltx_checkpoint_path(ckpt_name, alias_map=MLX_LTX_AUDIO_VAE_ALIASES)
+            if ckpt_path is not None:
+                return io.NodeOutput(load_mlx_ltx_checkpoint(ckpt_path)[2])
+        except ImportError:
+            pass
+
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
         sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
         sd = comfy.utils.state_dict_prefix_replace(sd, {"audio_vae.": "autoencoder.", "vocoder.": "vocoder."}, filter_keys=True)
@@ -77,6 +93,21 @@ class LTXVAudioVAEDecode(io.ComfyNode):
 
     @classmethod
     def execute(cls, samples, audio_vae) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import (
+                is_mlx_ltx_media_latent,
+                make_mlx_ltx_audio_proxy,
+                mlx_ltx_media_components,
+                mlx_ltx_media_passthrough_enabled,
+            )
+
+            if is_mlx_ltx_media_latent(samples):
+                if mlx_ltx_media_passthrough_enabled(samples):
+                    return io.NodeOutput(make_mlx_ltx_audio_proxy(samples))
+                return io.NodeOutput(mlx_ltx_media_components(samples).audio)
+        except ImportError:
+            pass
+
         audio_latent = samples["samples"]
         if audio_latent.is_nested:
             audio_latent = audio_latent.unbind()[-1]
@@ -144,6 +175,23 @@ class LTXVEmptyLatentAudio(io.ComfyNode):
         """Generate empty audio latents matching the reference pipeline structure."""
 
         assert audio_vae is not None, "Audio VAE model is required"
+        try:
+            from comfy.backends.mlx_ltx_backend import is_mlx_ltx_vae
+
+            if is_mlx_ltx_vae(audio_vae):
+                num_audio_latents = audio_vae.first_stage_model.num_of_latents_from_frames(frames_number, frame_rate)
+                audio_latents = torch.zeros(
+                    (batch_size, 8, num_audio_latents, 16),
+                    device=comfy.model_management.intermediate_device(),
+                )
+                return io.NodeOutput(
+                    {
+                        "samples": audio_latents,
+                        "type": "audio",
+                    }
+                )
+        except ImportError:
+            pass
 
         z_channels = audio_vae.latent_channels
         audio_freq = audio_vae.first_stage_model.latent_frequency_bins
@@ -166,6 +214,15 @@ class LTXVEmptyLatentAudio(io.ComfyNode):
 class LTXAVTextEncoderLoader(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
+        text_encoders = folder_paths.get_filename_list("text_encoders")
+        ckpt_names = folder_paths.get_filename_list("checkpoints")
+        try:
+            from comfy.backends.mlx_ltx_backend import MLX_LTX_TEXT_ENCODER_ALIASES, list_mlx_ltx_checkpoint_choices
+
+            text_encoders = sorted(set(text_encoders).union(MLX_LTX_TEXT_ENCODER_ALIASES))
+            ckpt_names = sorted(set(ckpt_names).union(list_mlx_ltx_checkpoint_choices()))
+        except ImportError:
+            pass
         return io.Schema(
             node_id="LTXAVTextEncoderLoader",
             display_name="LTXV Audio Text Encoder Loader",
@@ -174,11 +231,11 @@ class LTXAVTextEncoderLoader(io.ComfyNode):
             inputs=[
                 io.Combo.Input(
                     "text_encoder",
-                    options=folder_paths.get_filename_list("text_encoders"),
+                    options=text_encoders,
                 ),
                 io.Combo.Input(
                     "ckpt_name",
-                    options=folder_paths.get_filename_list("checkpoints"),
+                    options=ckpt_names,
                 ),
                 io.Combo.Input(
                     "device",
@@ -192,6 +249,17 @@ class LTXAVTextEncoderLoader(io.ComfyNode):
     @classmethod
     def execute(cls, text_encoder, ckpt_name, device="default"):
         clip_type = comfy.sd.CLIPType.LTXV
+
+        try:
+            from comfy.backends.mlx_ltx_backend import MLX_LTX_TEXT_ENCODER_ALIASES, load_mlx_ltx_checkpoint, resolve_mlx_ltx_checkpoint_path
+
+            ckpt_path = resolve_mlx_ltx_checkpoint_path(ckpt_name)
+            if ckpt_path is None:
+                ckpt_path = resolve_mlx_ltx_checkpoint_path(text_encoder, alias_map=MLX_LTX_TEXT_ENCODER_ALIASES)
+            if ckpt_path is not None:
+                return io.NodeOutput(load_mlx_ltx_checkpoint(ckpt_path)[1])
+        except ImportError:
+            pass
 
         clip_path1 = folder_paths.get_full_path_or_raise("text_encoders", text_encoder)
         clip_path2 = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)

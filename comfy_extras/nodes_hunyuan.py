@@ -175,12 +175,19 @@ class HunyuanVideo15SuperResolution(io.ComfyNode):
 class LatentUpscaleModelLoader(io.ComfyNode):
     @classmethod
     def define_schema(cls):
+        model_names = folder_paths.get_filename_list("latent_upscale_models")
+        try:
+            from comfy.backends.mlx_ltx_backend import MLX_LTX_LATENT_UPSCALER_ALIASES, list_mlx_ltx_checkpoint_choices
+
+            model_names = sorted(set(model_names).union(list_mlx_ltx_checkpoint_choices(aliases=False)).union(MLX_LTX_LATENT_UPSCALER_ALIASES))
+        except ImportError:
+            pass
         return io.Schema(
             node_id="LatentUpscaleModelLoader",
             display_name="Load Latent Upscale Model",
             category="loaders",
             inputs=[
-                io.Combo.Input("model_name", options=folder_paths.get_filename_list("latent_upscale_models")),
+                io.Combo.Input("model_name", options=model_names),
             ],
             outputs=[
                 io.LatentUpscaleModel.Output(),
@@ -189,6 +196,19 @@ class LatentUpscaleModelLoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, model_name) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import (
+                MLX_LTX_LATENT_UPSCALER_ALIASES,
+                load_mlx_ltx_latent_upscaler,
+                resolve_mlx_ltx_checkpoint_path,
+            )
+
+            model_path = resolve_mlx_ltx_checkpoint_path(model_name, alias_map=MLX_LTX_LATENT_UPSCALER_ALIASES)
+            if model_path is not None:
+                return io.NodeOutput(load_mlx_ltx_latent_upscaler(model_path))
+        except ImportError:
+            pass
+
         model_path = folder_paths.get_full_path_or_raise("latent_upscale_models", model_name)
         sd, metadata = comfy.utils.load_torch_file(model_path, safe_load=True, return_metadata=True)
 

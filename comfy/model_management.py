@@ -1830,7 +1830,15 @@ def synchronize():
         torch.cuda.synchronize()
 
 def soft_empty_cache(force=False):
+    def empty_optional_backend_caches():
+        try:
+            import comfy.backends
+            comfy.backends.empty_backend_caches()
+        except Exception as e:
+            logging.debug("Optional backend cache cleanup failed: %s", e)
+
     if cpu_mode():
+        empty_optional_backend_caches()
         return
     global cpu_state
     if cpu_state == CPUState.MPS:
@@ -1846,9 +1854,15 @@ def soft_empty_cache(force=False):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+    empty_optional_backend_caches()
 
 def unload_all_models():
     free_memory(1e30, get_torch_device())
+    try:
+        import comfy.backends
+        comfy.backends.unload_backend_models()
+    except Exception as e:
+        logging.debug("Optional backend unload failed: %s", e)
 
 def debug_memory_summary():
     if is_amd() or is_nvidia():

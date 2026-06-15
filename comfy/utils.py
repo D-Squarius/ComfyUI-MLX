@@ -118,11 +118,42 @@ def load_safetensors(ckpt):
     return sd, header.get("__metadata__", {}),
 
 
+def load_sharded_safetensors(index_path, device):
+    with open(index_path, encoding="utf-8") as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Invalid safetensors shard index: {index_path}")
+
+    keys_by_shard = {}
+    for key, shard in weight_map.items():
+        keys_by_shard.setdefault(str(shard), []).append(key)
+
+    sd = {}
+    metadata = dict(index.get("metadata") or {})
+    base = os.path.dirname(index_path)
+    for shard in sorted(keys_by_shard):
+        shard_path = os.path.join(base, shard)
+        with safetensors.safe_open(shard_path, framework="pt", device=device.type) as f:
+            if not metadata and f.metadata():
+                metadata = f.metadata()
+            for key in keys_by_shard[shard]:
+                tensor = f.get_tensor(key)
+                if DISABLE_MMAP:
+                    tensor = tensor.to(device=device, copy=True)
+                sd[key] = tensor
+    return sd, metadata
+
+
 def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
     if device is None:
         device = torch.device("cpu")
     metadata = None
-    if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
+    if ckpt.lower().endswith(".safetensors.index.json"):
+        sd, metadata = load_sharded_safetensors(ckpt, device)
+        if not return_metadata:
+            metadata = None
+    elif ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
         try:
             if comfy.memory_management.aimdo_enabled:
                 sd, metadata = load_safetensors(ckpt)

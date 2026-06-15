@@ -1,0 +1,2 @@
+uint elem = thread_position_in_grid.x;
+out[elem] = a[elem] + b[elem];

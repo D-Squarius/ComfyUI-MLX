@@ -5,6 +5,68 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+mlx = [
+  "mlx>=0.31.2,<0.32",
+  "huggingface_hub",
+]
+mlx-llm = [
+  "mlx-lm>=0.31.3",
+  "huggingface_hub",
+]
+mlx-vlm = [
+  "mlx-vlm>=0.5.0",
+  "pillow",
+  "huggingface_hub",
+]
+mlx-audio = [
+  "mlx-audio>=0.4.3",
+  "huggingface_hub",
+]
+mlx-embeddings = [
+  "mlx-embeddings>=0.1.0",
+  "huggingface_hub",
+]
+mtplx = [
+  "mtplx>=0.3.7",
+]
+mlx-ltx = [
+  "mlx>=0.31.2,<0.32",
+  "ltx-core-mlx>=0.14.8,<0.15",
+  "ltx-pipelines-mlx>=0.14.8,<0.15",
+  "huggingface_hub",
+  "pillow",
+  "av",
+]
+mlx-all = [
+  "mlx-lm>=0.31.3",
+  "mlx-vlm>=0.5.0",
+  "mlx-audio>=0.4.3",
+  "mlx-embeddings>=0.1.0",
+  "mlx>=0.31.2,<0.32",
+  "ltx-core-mlx>=0.14.8,<0.15",
+  "ltx-pipelines-mlx>=0.14.8,<0.15",
+  "pillow",
+  "av",
+  "huggingface_hub",
+]
+benchmark-gguf = [
+  "llama-cpp-python",
+  "huggingface_hub",
+]
+benchmark-transformers = [
+  "transformers",
+  "torch",
+  "huggingface_hub",
+]
+benchmark-all = [
+  "llama-cpp-python",
+  "transformers",
+  "torch",
+  "huggingface_hub",
+  "av",
+]
+
 [project.urls]
 homepage = "https://www.comfy.org/"
 repository = "https://github.com/comfyanonymous/ComfyUI"

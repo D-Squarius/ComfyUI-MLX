@@ -747,6 +747,15 @@ class SamplerCustom(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import is_mlx_ltx_model, run_mlx_ltx_sampling
+
+            if is_mlx_ltx_model(model):
+                out = run_mlx_ltx_sampling(model, positive, negative, latent_image, seed=noise_seed, cfg=cfg)
+                return io.NodeOutput(out, out)
+        except ImportError:
+            pass
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
@@ -950,6 +959,19 @@ class SamplerCustomAdvanced(io.ComfyNode):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import is_mlx_ltx_model, run_mlx_ltx_sampling
+
+            model = getattr(guider, "model_patcher", None)
+            if is_mlx_ltx_model(model):
+                positive = getattr(guider, "original_conds", {}).get("positive")
+                negative = getattr(guider, "original_conds", {}).get("negative")
+                cfg = getattr(guider, "cfg", None)
+                out = run_mlx_ltx_sampling(model, positive, negative, latent_image, seed=getattr(noise, "seed", None), cfg=cfg)
+                return io.NodeOutput(out, out)
+        except ImportError:
+            pass
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
@@ -964,8 +986,27 @@ class SamplerCustomAdvanced(io.ComfyNode):
         callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-        samples = guider.sample(noise.generate_noise(latent), latent_image, sampler, sigmas, denoise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=noise.seed)
+        comfy.samplers._ltx_sampler_trace_event(
+            getattr(guider, "model_options", {}),
+            "sampler_custom_advanced.start",
+            {"latent_image": latent_image, "sigmas": sigmas, "noise_mask": noise_mask},
+            {"seed": getattr(noise, "seed", None)},
+        )
+        noise_tensor = noise.generate_noise(latent)
+        comfy.samplers._ltx_sampler_trace_event(
+            getattr(guider, "model_options", {}),
+            "sampler_custom_advanced.generated_noise",
+            {"noise": noise_tensor, "latent_image": latent_image, "sigmas": sigmas},
+            {"seed": getattr(noise, "seed", None)},
+        )
+        samples = guider.sample(noise_tensor, latent_image, sampler, sigmas, denoise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=noise.seed)
         samples = samples.to(comfy.model_management.intermediate_device())
+        comfy.samplers._ltx_sampler_trace_event(
+            getattr(guider, "model_options", {}),
+            "sampler_custom_advanced.end",
+            {"samples": samples},
+            {"seed": getattr(noise, "seed", None)},
+        )
 
         out = latent.copy()
         out.pop("downscale_ratio_spacial", None)

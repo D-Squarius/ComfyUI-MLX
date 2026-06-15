@@ -16,6 +16,25 @@ from comfy_api.latest import ComfyExtension, io
 
 ICLoRAParameters = io.Custom("IC_LORA_PARAMETERS")
 
+LTX_2_3_DISTILLED_STAGE1_SIGMAS = (
+    1.0,
+    0.99375,
+    0.9875,
+    0.98125,
+    0.975,
+    0.909375,
+    0.725,
+    0.421875,
+    0.0,
+)
+
+LTX_2_3_DISTILLED_STAGE2_SIGMAS = (
+    0.909375,
+    0.725,
+    0.421875,
+    0.0,
+)
+
 
 class GetICLoRAParameters(io.ComfyNode):
     @classmethod
@@ -570,6 +589,14 @@ class ModelSamplingLTXV(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, max_shift, base_shift, latent=None) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import is_mlx_ltx_model
+
+            if is_mlx_ltx_model(model):
+                return io.NodeOutput(model)
+        except ImportError:
+            pass
+
         m = model.clone()
 
         if latent is None:
@@ -622,6 +649,13 @@ class LTXVScheduler(io.ComfyNode):
                     advanced=True,
                 ),
                 io.Latent.Input("latent", optional=True),
+                io.Combo.Input(
+                    "schedule",
+                    options=["ltxv_shifted", "ltx_2_3_distilled_stage1", "ltx_2_3_distilled_stage2"],
+                    default="ltxv_shifted",
+                    advanced=True,
+                    tooltip="Use ltxv_shifted for the stock shifted schedule. Use the distilled LTX 2.3 presets for the 8+3 distilled workflow.",
+                ),
             ],
             outputs=[
                 io.Sigmas.Output(),
@@ -629,7 +663,21 @@ class LTXVScheduler(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, steps, max_shift, base_shift, stretch, terminal, latent=None) -> io.NodeOutput:
+    def execute(cls, steps, max_shift, base_shift, stretch, terminal, latent=None, schedule="ltxv_shifted") -> io.NodeOutput:
+        schedule = str(schedule or "ltxv_shifted")
+        if schedule in {"ltx_2_3_distilled_stage1", "ltx_2_3_distilled_stage2"}:
+            table = (
+                LTX_2_3_DISTILLED_STAGE1_SIGMAS
+                if schedule == "ltx_2_3_distilled_stage1"
+                else LTX_2_3_DISTILLED_STAGE2_SIGMAS
+            )
+            count = int(steps) + 1
+            if count > len(table):
+                raise ValueError(f"Requested {steps} steps but {schedule} only supports {len(table) - 1} steps.")
+            return io.NodeOutput(torch.tensor(table[:count], dtype=torch.float32))
+        if schedule != "ltxv_shifted":
+            raise ValueError(f"Unsupported LTXV sigma schedule: {schedule}")
+
         if latent is None:
             tokens = 4096
         else:
@@ -654,10 +702,12 @@ class LTXVScheduler(io.ComfyNode):
         if stretch:
             non_zero_mask = sigmas != 0
             non_zero_sigmas = sigmas[non_zero_mask]
-            one_minus_z = 1.0 - non_zero_sigmas
-            scale_factor = one_minus_z[-1] / (1.0 - terminal)
-            stretched = 1.0 - (one_minus_z / scale_factor)
-            sigmas[non_zero_mask] = stretched
+            if non_zero_sigmas.numel() > 1:
+                one_minus_z = 1.0 - non_zero_sigmas
+                scale_factor = float((one_minus_z[-1] / (1.0 - terminal)).item())
+                if math.isfinite(scale_factor) and scale_factor != 0.0:
+                    stretched = 1.0 - (one_minus_z / scale_factor)
+                    sigmas[non_zero_mask] = stretched
 
         return io.NodeOutput(sigmas)
 
@@ -748,6 +798,21 @@ class LTXVConcatAVLatent(io.ComfyNode):
 
     @classmethod
     def execute(cls, video_latent, audio_latent) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import is_mlx_ltx_audio_placeholder, is_mlx_ltx_media_latent
+
+            if is_mlx_ltx_media_latent(video_latent):
+                output = video_latent.copy()
+                output["mlx_ltx_audio_latent"] = audio_latent
+                return io.NodeOutput(output)
+            if is_mlx_ltx_audio_placeholder(audio_latent):
+                output = video_latent.copy()
+                output["mlx_ltx_audio_latent"] = audio_latent
+                output["type"] = "mlx_ltx_video_audio_placeholder"
+                return io.NodeOutput(output)
+        except ImportError:
+            pass
+
         output = {}
         output.update(video_latent)
         output.update(audio_latent)
@@ -784,6 +849,18 @@ class LTXVSeparateAVLatent(io.ComfyNode):
 
     @classmethod
     def execute(cls, av_latent) -> io.NodeOutput:
+        try:
+            from comfy.backends.mlx_ltx_backend import is_mlx_ltx_media_latent
+
+            if is_mlx_ltx_media_latent(av_latent):
+                video_latent = av_latent.copy()
+                video_latent["mlx_ltx_media_kind"] = "video"
+                audio_latent = av_latent.copy()
+                audio_latent["mlx_ltx_media_kind"] = "audio"
+                return io.NodeOutput(video_latent, audio_latent)
+        except ImportError:
+            pass
+
         latents = av_latent["samples"].unbind()
         video_latent = av_latent.copy()
         video_latent["samples"] = latents[0]

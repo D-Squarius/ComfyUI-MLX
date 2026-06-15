@@ -77,7 +77,12 @@ class CLIPTextEncode(ComfyNodeABC):
         if clip is None:
             raise RuntimeError("ERROR: clip input is invalid: None\n\nIf the clip is from a checkpoint loader node your checkpoint does not contain a valid clip or text encoder model.")
         tokens = clip.tokenize(text)
-        return (clip.encode_from_tokens_scheduled(tokens), )
+        conditioning = clip.encode_from_tokens_scheduled(tokens)
+        if os.environ.get("COMFY_BENCH_UNLOAD_AFTER_CLIP") == "1":
+            logging.info("COMFY_BENCH_UNLOAD_AFTER_CLIP=1: unloading Torch models after text encode")
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache(force=True)
+        return (conditioning, )
 
 
 class ConditioningCombine:
@@ -309,6 +314,21 @@ class VAEDecode:
     SEARCH_ALIASES = ["decode", "decode latent", "latent to image", "render latent"]
 
     def decode(self, vae, samples):
+        try:
+            from comfy.backends.mlx_ltx_backend import (
+                is_mlx_ltx_media_latent,
+                make_mlx_ltx_image_proxy,
+                mlx_ltx_media_components,
+                mlx_ltx_media_passthrough_enabled,
+            )
+
+            if is_mlx_ltx_media_latent(samples):
+                if mlx_ltx_media_passthrough_enabled(samples):
+                    return (make_mlx_ltx_image_proxy(samples),)
+                return (mlx_ltx_media_components(samples).images,)
+        except ImportError:
+            pass
+
         latent = samples["samples"]
         if latent.is_nested:
             latent = latent.unbind()[0]
@@ -333,6 +353,21 @@ class VAEDecodeTiled:
     CATEGORY = "experimental"
 
     def decode(self, vae, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
+        try:
+            from comfy.backends.mlx_ltx_backend import (
+                is_mlx_ltx_media_latent,
+                make_mlx_ltx_image_proxy,
+                mlx_ltx_media_components,
+                mlx_ltx_media_passthrough_enabled,
+            )
+
+            if is_mlx_ltx_media_latent(samples):
+                if mlx_ltx_media_passthrough_enabled(samples):
+                    return (make_mlx_ltx_image_proxy(samples),)
+                return (mlx_ltx_media_components(samples).images,)
+        except ImportError:
+            pass
+
         if tile_size < overlap * 4:
             overlap = tile_size // 4
         if temporal_size < temporal_overlap * 2:
@@ -588,9 +623,16 @@ class CheckpointLoader:
 class CheckpointLoaderSimple:
     @classmethod
     def INPUT_TYPES(s):
+        ckpt_names = folder_paths.get_filename_list("checkpoints")
+        try:
+            from comfy.backends.mlx_ltx_backend import list_mlx_ltx_checkpoint_choices
+
+            ckpt_names = sorted(set(ckpt_names).union(list_mlx_ltx_checkpoint_choices()))
+        except ImportError:
+            pass
         return {
             "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {"tooltip": "The name of the checkpoint (model) to load."}),
+                "ckpt_name": (ckpt_names, {"tooltip": "The name of the checkpoint (model) to load."}),
             }
         }
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
@@ -604,6 +646,14 @@ class CheckpointLoaderSimple:
     SEARCH_ALIASES = ["load model", "checkpoint", "model loader", "load checkpoint", "ckpt", "model"]
 
     def load_checkpoint(self, ckpt_name):
+        try:
+            from comfy.backends.mlx_ltx_backend import load_mlx_ltx_checkpoint, resolve_mlx_ltx_checkpoint_path
+
+            ckpt_path = resolve_mlx_ltx_checkpoint_path(ckpt_name)
+            if ckpt_path is not None:
+                return load_mlx_ltx_checkpoint(ckpt_path)
+        except ImportError:
+            pass
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
         out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
         return out[:3]
@@ -699,6 +749,18 @@ class LoraLoader:
             return (model, clip)
 
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        internal_ltx_lora = getattr(getattr(model, "model", None), "mlx_ltx_internal_lora_name", None)
+        if (
+            internal_ltx_lora
+            and clip is None
+            and os.path.basename(lora_path) == internal_ltx_lora
+            and abs(float(strength_model) - float(getattr(model.model, "mlx_ltx_internal_lora_strength", 0.0))) <= 1e-6
+        ):
+            model_lora = model.clone()
+            model_lora.model.mlx_ltx_visible_lora_name = internal_ltx_lora
+            model_lora.model.mlx_ltx_visible_lora_strength = float(strength_model)
+            return (model_lora, clip)
+
         lora = None
         lora_metadata = None
         if self.loaded_lora is not None:
@@ -935,7 +997,20 @@ class ControlNetApplyAdvanced:
 class UNETLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
+        unet_names = folder_paths.get_filename_list("diffusion_models")
+        try:
+            from comfy.backends.mlx_z_image import list_mlx_z_image_choices
+
+            unet_names = sorted(set(unet_names).union(list_mlx_z_image_choices()))
+        except ImportError:
+            pass
+        try:
+            from comfy.backends.mlx_klein import list_mlx_klein_choices
+
+            unet_names = sorted(set(unet_names).union(list_mlx_klein_choices()))
+        except ImportError:
+            pass
+        return {"required": { "unet_name": (unet_names, ),
                               "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"], {"advanced": True})
                              }}
     RETURN_TYPES = ("MODEL",)
@@ -944,6 +1019,30 @@ class UNETLoader:
     CATEGORY = "advanced/loaders"
 
     def load_unet(self, unet_name, weight_dtype):
+        try:
+            from comfy.backends.mlx_denoiser_island import ZImageIslandRuntime, create_z_image_mlx_island_model
+            from comfy.backends.mlx_z_image import resolve_mlx_z_image_model_path
+
+            z_image_path = resolve_mlx_z_image_model_path(unet_name)
+            if z_image_path is not None:
+                runtime = ZImageIslandRuntime(model_path=z_image_path)
+                return (create_z_image_mlx_island_model(runtime=runtime, dtype=torch.bfloat16),)
+        except ImportError:
+            pass
+        try:
+            from comfy.backends.mlx_klein import (
+                KleinIslandRuntime,
+                create_klein_mlx_island_model,
+                resolve_mlx_klein_model_path,
+            )
+
+            klein_path = resolve_mlx_klein_model_path(unet_name)
+            if klein_path is not None:
+                runtime = KleinIslandRuntime(model_path=klein_path)
+                return (create_klein_mlx_island_model(runtime=runtime, dtype=torch.bfloat16),)
+        except ImportError:
+            pass
+
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
@@ -958,10 +1057,13 @@ class UNETLoader:
         return (model,)
 
 class CLIPLoader:
+    MLX_TYPES = ["mlx_lm", "mlx_vlm", "mlx_audio_asr", "mlx_audio_tts", "mlx_embeddings"]
+    BENCHMARK_TYPES = ["gguf_lm", "transformers_lm"]
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "clip_name": (folder_paths.get_filename_list("text_encoders"), ),
-                              "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma", "ace", "omnigen2", "qwen_image", "hunyuan_image", "flux2", "ovis", "longcat_image", "cogvideox"], ),
+                              "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma", "ace", "omnigen2", "qwen_image", "hunyuan_image", "flux2", "ovis", "longcat_image", "cogvideox"] + s.MLX_TYPES + s.BENCHMARK_TYPES, ),
                               },
                 "optional": {
                               "device": (["default", "cpu"], {"advanced": True}),
@@ -971,16 +1073,24 @@ class CLIPLoader:
 
     CATEGORY = "advanced/loaders"
 
-    DESCRIPTION = "[Recipes]\n\nstable_diffusion: clip-l\nstable_cascade: clip-g\nsd3: t5 xxl/ clip-g / clip-l\nstable_audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\n hidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B"
+    DESCRIPTION = "[Recipes]\n\nstable_diffusion: clip-l\nstable_cascade: clip-g\nsd3: t5 xxl/ clip-g / clip-l\nstable_audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\n hidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B\nmlx_lm/mlx_vlm/mlx_audio_asr/mlx_audio_tts/mlx_embeddings: MLX manifest in text_encoders\ngguf_lm/transformers_lm: benchmark manifests in text_encoders"
 
     def load_clip(self, clip_name, type="stable_diffusion", device="default"):
-        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-
         model_options = {}
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
 
         clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
+        if type in self.MLX_TYPES:
+            from comfy.text_encoders.mlx import load_mlx_clip
+            clip = load_mlx_clip(clip_path, loader_type=type, model_options=model_options)
+            return (clip,)
+        if type in self.BENCHMARK_TYPES:
+            from comfy.text_encoders.baseline import load_baseline_clip
+            clip = load_baseline_clip(clip_path, loader_type=type, model_options=model_options)
+            return (clip,)
+
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         clip = comfy.sd.load_clip(ckpt_paths=[clip_path], embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options)
         return (clip,)
 
@@ -1537,8 +1647,40 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
     if "noise_mask" in latent:
         noise_mask = latent["noise_mask"]
 
-    callback = latent_preview.prepare_callback(model, steps)
-    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    if os.environ.get("COMFY_MLX_Z_IMAGE_NATIVE_RES_MULTISTEP", "").strip().lower() in {"1", "true", "yes", "on"}:
+        from comfy.backends.mlx_denoiser_island import try_z_image_native_res_multistep_sampler
+
+        samples = try_z_image_native_res_multistep_sampler(
+            model=model,
+            noise=noise,
+            latent_image=latent_image,
+            positive=positive,
+            negative=negative,
+            steps=steps,
+            cfg=cfg,
+            sampler_name=sampler_name,
+            scheduler=scheduler,
+            denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_step,
+            last_step=last_step,
+            force_full_denoise=force_full_denoise,
+            noise_mask=noise_mask,
+            seed=seed,
+        )
+        if samples is not None:
+            out = latent.copy()
+            out.pop("downscale_ratio_spacial", None)
+            out.pop("downscale_ratio_temporal", None)
+            out["samples"] = samples
+            return (out, )
+
+    if os.environ.get("COMFY_BENCH_DISABLE_LATENT_PREVIEW", "").strip().lower() in {"1", "true", "yes", "on"}:
+        callback = None
+        disable_pbar = True
+    else:
+        callback = latent_preview.prepare_callback(model, steps)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
                                   denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
                                   force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)

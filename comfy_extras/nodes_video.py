@@ -10,6 +10,7 @@ from typing_extensions import override
 from fractions import Fraction
 from comfy_api.latest import ComfyExtension, io, ui, Input, InputImpl, Types
 from comfy.cli_args import args
+from comfy.backends.benchmark_stats import elapsed_seconds, now, write_event
 
 class SaveWEBM(io.ComfyNode):
     @classmethod
@@ -88,6 +89,8 @@ class SaveVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, video: Input.Video, filename_prefix, format: str, codec) -> io.NodeOutput:
+        save_start = now()
+        video_class = video.__class__.__name__
         width, height = video.get_dimensions()
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
             filename_prefix,
@@ -110,6 +113,14 @@ class SaveVideo(io.ComfyNode):
             format=Types.VideoContainer(format),
             codec=codec,
             metadata=saved_metadata
+        )
+        write_event(
+            "mlx_ltx_save_video_end",
+            stage="save_video",
+            seconds=elapsed_seconds(save_start),
+            video_class=video_class,
+            format=format,
+            codec=codec,
         )
 
         return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
@@ -137,9 +148,55 @@ class CreateVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, images: Input.Image, fps: float, audio: Optional[Input.Audio] = None) -> io.NodeOutput:
-        return io.NodeOutput(
-            InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=audio, frame_rate=Fraction(fps)))
+        create_start = now()
+        try:
+            from comfy.backends.mlx_ltx_backend import (
+                is_mlx_ltx_audio_proxy,
+                is_mlx_ltx_image_proxy,
+                materialize_mlx_ltx_audio_proxy,
+                materialize_mlx_ltx_image_proxy,
+                mlx_ltx_video_from_proxy,
+            )
+
+            if is_mlx_ltx_image_proxy(images):
+                if audio is None or (is_mlx_ltx_audio_proxy(audio) and audio.media_path == images.media_path):
+                    video = mlx_ltx_video_from_proxy(images)
+                    write_event(
+                        "mlx_ltx_create_video_end",
+                        stage="create_video",
+                        seconds=elapsed_seconds(create_start),
+                        media_passthrough=True,
+                        media_path=images.media_path,
+                    )
+                    return io.NodeOutput(video)
+
+                materialized_images = materialize_mlx_ltx_image_proxy(images)
+                if is_mlx_ltx_audio_proxy(audio):
+                    audio = materialize_mlx_ltx_audio_proxy(audio)
+                video = InputImpl.VideoFromComponents(
+                    Types.VideoComponents(images=materialized_images, audio=audio, frame_rate=Fraction(fps))
+                )
+                write_event(
+                    "mlx_ltx_create_video_end",
+                    stage="create_video",
+                    seconds=elapsed_seconds(create_start),
+                    media_passthrough=False,
+                    media_path=images.media_path,
+                )
+                return io.NodeOutput(video)
+            if is_mlx_ltx_audio_proxy(audio):
+                audio = materialize_mlx_ltx_audio_proxy(audio)
+        except ImportError:
+            pass
+
+        video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=audio, frame_rate=Fraction(fps)))
+        write_event(
+            "mlx_ltx_create_video_end",
+            stage="create_video",
+            seconds=elapsed_seconds(create_start),
+            media_passthrough=False,
         )
+        return io.NodeOutput(video)
 
 class GetVideoComponents(io.ComfyNode):
     @classmethod

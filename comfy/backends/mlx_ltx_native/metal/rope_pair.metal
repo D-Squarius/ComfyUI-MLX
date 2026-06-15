@@ -1,0 +1,10 @@
+uint pair_index = thread_position_in_grid.x;
+uint even_index = pair_index * 2;
+uint odd_index = even_index + 1;
+uint pair_in_head = pair_index % ({{HEAD_DIM}} / 2);
+T x_even = x[even_index];
+T x_odd = x[odd_index];
+T c = cos[pair_in_head];
+T s = sin[pair_in_head];
+out[even_index] = x_even * c - x_odd * s;
+out[odd_index] = x_even * s + x_odd * c;

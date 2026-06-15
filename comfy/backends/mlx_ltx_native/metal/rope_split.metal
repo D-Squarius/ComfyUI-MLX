@@ -1,0 +1,11 @@
+uint elem = thread_position_in_grid.x;
+uint col = elem % {{HEAD_DIM}};
+uint row = elem / {{HEAD_DIM}};
+uint half_dim = {{HEAD_DIM}} / 2;
+uint pair_col = col < half_dim ? col : col - half_dim;
+uint pair_idx = row * half_dim + pair_col;
+T c = cos[pair_idx];
+T s = sin[pair_idx];
+T x1 = x[row * {{HEAD_DIM}} + pair_col];
+T x2 = x[row * {{HEAD_DIM}} + pair_col + half_dim];
+out[elem] = col < half_dim ? (x1 * c - x2 * s) : (x1 * s + x2 * c);

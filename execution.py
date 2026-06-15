@@ -2,6 +2,7 @@ import copy
 import heapq
 import inspect
 import logging
+import os
 import psutil
 import sys
 import threading
@@ -18,6 +19,7 @@ import comfy.memory_management
 import comfy.model_management
 import comfy.model_prefetch
 import comfy_aimdo.model_vbar
+from comfy.backends import benchmark_stats as comfy_benchmark_stats
 
 from latent_preview import set_preview_method
 import nodes
@@ -220,6 +222,33 @@ def get_input_data(inputs, class_def, unique_id, execution_list=None, dynprompt=
 
 map_node_over_list = None #Don't hook this please
 
+def _bench_profile_nodes_enabled():
+    return comfy_benchmark_stats.benchmark_enabled() and os.environ.get("COMFY_BENCH_PROFILE_NODES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+def _bench_node_class_name(obj):
+    if is_class(obj):
+        return getattr(obj, "__name__", str(obj))
+    return obj.__class__.__name__
+
+def _write_bench_node_event(prompt_id, unique_id, obj, func, list_index, start, status, error=""):
+    if not _bench_profile_nodes_enabled():
+        return
+    try:
+        comfy_benchmark_stats.write_event(
+            "comfy_node_execute_end",
+            prompt_id=prompt_id,
+            node_id=unique_id,
+            class_type=_bench_node_class_name(obj),
+            function=func,
+            list_index=list_index,
+            status=status,
+            error=comfy_benchmark_stats.redact_secrets(error) if error else "",
+            seconds=comfy_benchmark_stats.elapsed_seconds(start),
+            memory=comfy_benchmark_stats.memory_snapshot(),
+        )
+    except Exception:
+        pass
+
 async def resolve_map_node_over_list_results(results):
     remaining = [x for x in results if isinstance(x, asyncio.Task) and not x.done()]
     if len(remaining) == 0:
@@ -284,7 +313,14 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
             if inspect.iscoroutinefunction(f):
                 async def async_wrapper(f, prompt_id, unique_id, list_index, args):
                     with CurrentNodeContext(prompt_id, unique_id, list_index):
-                        return await f(**args)
+                        bench_start = comfy_benchmark_stats.now()
+                        try:
+                            result = await f(**args)
+                        except Exception as e:
+                            _write_bench_node_event(prompt_id, unique_id, obj, func, list_index, bench_start, "error", e)
+                            raise
+                        _write_bench_node_event(prompt_id, unique_id, obj, func, list_index, bench_start, "success")
+                        return result
                 task = asyncio.create_task(async_wrapper(f, prompt_id, unique_id, index, args=inputs))
                 # Give the task a chance to execute without yielding
                 await asyncio.sleep(0)
@@ -295,7 +331,13 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                     results.append(task)
             else:
                 with CurrentNodeContext(prompt_id, unique_id, index):
-                    result = f(**inputs)
+                    bench_start = comfy_benchmark_stats.now()
+                    try:
+                        result = f(**inputs)
+                    except Exception as e:
+                        _write_bench_node_event(prompt_id, unique_id, obj, func, index, bench_start, "error", e)
+                        raise
+                    _write_bench_node_event(prompt_id, unique_id, obj, func, index, bench_start, "success")
                 results.append(result)
         else:
             results.append(execution_block)
@@ -726,6 +768,13 @@ class PromptExecutor:
         self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False)
 
+        benchmark_start = comfy_benchmark_stats.now()
+        memory_sampler = None
+        if comfy_benchmark_stats.benchmark_enabled():
+            memory_sampler = comfy_benchmark_stats.MemorySampler()
+            memory_sampler.start()
+            comfy_benchmark_stats.write_event("comfy_prompt_start", prompt_id=prompt_id, memory=memory_sampler.snapshot())
+
         self._notify_prompt_lifecycle("start", prompt_id)
         ram_headroom = int(self.cache_args["ram"] * (1024 ** 3))
         ram_inactive_headroom = int(self.cache_args["ram_inactive"] * (1024 ** 3))
@@ -819,6 +868,14 @@ class PromptExecutor:
         finally:
             comfy.memory_management.set_ram_cache_release_state(None, 0)
             self._notify_prompt_lifecycle("end", prompt_id)
+            if memory_sampler is not None:
+                comfy_benchmark_stats.write_event(
+                    "comfy_prompt_end",
+                    prompt_id=prompt_id,
+                    seconds=comfy_benchmark_stats.elapsed_seconds(benchmark_start),
+                    success=bool(self.success),
+                    memory=memory_sampler.stop(),
+                )
 
 
 async def validate_inputs(prompt_id, prompt, item, validated, visiting=None):

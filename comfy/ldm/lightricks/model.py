@@ -17,6 +17,33 @@ from .symmetric_patchifier import SymmetricPatchifier, latent_to_pixel_coords
 
 logger = logging.getLogger(__name__)
 
+
+def _ltx_sampler_finite_trace(transformer_options, boundary, tensors=None, metadata=None):
+    try:
+        import comfy.samplers
+        comfy.samplers._ltx_sampler_trace_event(transformer_options, boundary, tensors or {}, metadata or {})
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning("LTX sampler finite trace failed at %s: %s", boundary, exc)
+
+
+def _ltx_sampler_should_trace_block_stage(transformer_options, block_index, stage):
+    try:
+        import comfy.samplers
+        return comfy.samplers._ltx_sampler_trace_should_trace_block(transformer_options, block_index, stage)
+    except Exception:
+        return False
+
+
+def _ltx_sampler_should_use_workaround(transformer_options, block_index, stage, workaround_name):
+    try:
+        import comfy.samplers
+        return comfy.samplers._ltx_sampler_trace_should_use_workaround(transformer_options, block_index, stage, workaround_name)
+    except Exception:
+        return False
+
+
 def _log_base(x, base):
     return np.log(x) / np.log(base)
 
@@ -330,7 +357,7 @@ def apply_rotary_emb(input_tensor, freqs_cis):
         apply_interleaved_rotary_emb(input_tensor, cos_freqs, sin_freqs)
     )
 
-def apply_interleaved_rotary_emb(input_tensor, cos_freqs, sin_freqs):  # TODO: remove duplicate funcs and pick the best/fastest one
+def apply_interleaved_rotary_emb(input_tensor, cos_freqs, sin_freqs):
     t_dup = rearrange(input_tensor, "... (d r) -> ... d r", r=2)
     t1, t2 = t_dup.unbind(dim=-1)
     t_dup = torch.stack((-t2, t1), dim=-1)
@@ -452,18 +479,34 @@ class CrossAttention(nn.Module):
             operations.Linear(inner_dim, query_dim, dtype=dtype, device=device), nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
-        q = self.to_q(x)
-        context = x if context is None else context
-        k = self.to_k(context)
-        v = self.to_v(context)
+    def _linear_fp32(self, layer, x):
+        weight = layer.weight.float()
+        bias = layer.bias.float() if getattr(layer, "bias", None) is not None else None
+        return torch.nn.functional.linear(x.float(), weight, bias)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+    def _rms_norm_fp32(self, norm, x):
+        weight = norm.weight.float() if getattr(norm, "weight", None) is not None else None
+        return torch.nn.functional.rms_norm(x.float(), norm.normalized_shape, weight, norm.eps)
+
+    def _forward_fp32_attention(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}, trace_attention=None):
+        original_dtype = x.dtype
+        context = x if context is None else context
+        q = self._linear_fp32(self.to_q, x)
+        k = self._linear_fp32(self.to_k, context)
+        v = self._linear_fp32(self.to_v, context)
+        if trace_attention is not None:
+            trace_attention("fp32_qkv_projection", {"q": q, "k": k, "v": v})
+
+        q = self._rms_norm_fp32(self.q_norm, q)
+        k = self._rms_norm_fp32(self.k_norm, k)
+        if trace_attention is not None:
+            trace_attention("fp32_qk_norm", {"q": q, "k": k, "v": v})
 
         if pe is not None:
             q = apply_rotary_emb(q, pe)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
+            if trace_attention is not None:
+                trace_attention("fp32_rope", {"q": q, "k": k, "v": v})
 
         if mask is None:
             out = comfy.ldm.modules.attention.optimized_attention(q, k, v, self.heads, attn_precision=self.attn_precision, transformer_options=transformer_options)
@@ -471,6 +514,80 @@ class CrossAttention(nn.Module):
             out = _attention_with_guide_mask(q, k, v, self.heads, mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
         else:
             out = comfy.ldm.modules.attention.optimized_attention(q, k, v, self.heads, mask=mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
+        if trace_attention is not None:
+            trace_attention("fp32_sdpa_output", {"out": out})
+
+        if self.to_gate_logits is not None:
+            gate_logits = self._linear_fp32(self.to_gate_logits, x)
+            b, t, _ = out.shape
+            out = out.view(b, t, self.heads, self.dim_head)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            if trace_attention is not None:
+                trace_attention("fp32_head_gate", {"gate_logits": gate_logits, "gates": gates, "out": out})
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.heads * self.dim_head)
+
+        out = self._linear_fp32(self.to_out[0], out)
+        if trace_attention is not None:
+            trace_attention("fp32_output_projection", {"out": out})
+        return out.to(dtype=original_dtype)
+
+    def forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}, trace_label=None, trace_block_index=None):
+        def trace_attention(stage, tensors):
+            if trace_label is None or trace_block_index is None:
+                return
+            composed_stage = f"{trace_label}.{stage}"
+            if _ltx_sampler_should_trace_block_stage(transformer_options, trace_block_index, composed_stage):
+                _ltx_sampler_finite_trace(
+                    transformer_options,
+                    f"ltx_av.attention_stage.{composed_stage}",
+                    tensors,
+                    {"block_index": trace_block_index, "attention": trace_label, "stage": stage},
+                )
+
+        trace_attention("input", {"x": x, "context": context, "mask": mask, "pe": pe, "k_pe": k_pe})
+        if (
+            trace_label == "audio_text_cross_attention"
+            and trace_block_index is not None
+            and _ltx_sampler_should_use_workaround(
+                transformer_options,
+                trace_block_index,
+                f"{trace_label}.fp32_attention",
+                "audio_text_attention_fp32",
+            )
+        ):
+            return self._forward_fp32_attention(
+                x,
+                context=context,
+                mask=mask,
+                pe=pe,
+                k_pe=k_pe,
+                transformer_options=transformer_options,
+                trace_attention=trace_attention,
+            )
+
+        q = self.to_q(x)
+        context = x if context is None else context
+        k = self.to_k(context)
+        v = self.to_v(context)
+        trace_attention("qkv_projection", {"q": q, "k": k, "v": v})
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        trace_attention("qk_norm", {"q": q, "k": k, "v": v})
+
+        if pe is not None:
+            q = apply_rotary_emb(q, pe)
+            k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
+            trace_attention("rope", {"q": q, "k": k, "v": v})
+
+        if mask is None:
+            out = comfy.ldm.modules.attention.optimized_attention(q, k, v, self.heads, attn_precision=self.attn_precision, transformer_options=transformer_options)
+        elif isinstance(mask, GuideAttentionMask):
+            out = _attention_with_guide_mask(q, k, v, self.heads, mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
+        else:
+            out = comfy.ldm.modules.attention.optimized_attention(q, k, v, self.heads, mask=mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
+        trace_attention("sdpa_output", {"out": out})
 
         # Apply per-head gating if enabled
         if self.to_gate_logits is not None:
@@ -478,10 +595,14 @@ class CrossAttention(nn.Module):
             b, t, _ = out.shape
             out = out.view(b, t, self.heads, self.dim_head)
             gates = 2.0 * torch.sigmoid(gate_logits)  # zero-init -> identity
+            trace_attention("head_gate", {"gate_logits": gate_logits, "gates": gates, "out": out})
             out = out * gates.unsqueeze(-1)
             out = out.view(b, t, self.heads * self.dim_head)
+            trace_attention("head_gate_output", {"out": out})
 
-        return self.to_out(out)
+        out = self.to_out(out)
+        trace_attention("output_projection", {"out": out})
+        return out
 
 # 6 base ADaLN params (shift/scale/gate for MSA + MLP), +3 for cross-attention Q (shift/scale/gate)
 ADALN_BASE_PARAMS_COUNT = 6
@@ -569,7 +690,7 @@ def compute_prompt_timestep(adaln_module, timestep_scaled, batch_size, hidden_dt
 def apply_cross_attention_adaln(
     x, context, attn, q_shift, q_scale, q_gate,
     prompt_scale_shift_table, prompt_timestep,
-    attention_mask=None, transformer_options={},
+    attention_mask=None, transformer_options={}, trace_label=None, trace_block_index=None,
 ):
     """Apply cross-attention with ADaLN modulation (shift/scale/gate on Q and KV).
 
@@ -583,7 +704,43 @@ def apply_cross_attention_adaln(
     ).unbind(dim=2)
     attn_input = comfy.ldm.common_dit.rms_norm(x) * (1 + q_scale) + q_shift
     encoder_hidden_states = context * (1 + scale_kv) + shift_kv
-    return attn(attn_input, context=encoder_hidden_states, mask=attention_mask, transformer_options=transformer_options) * q_gate
+    if trace_label is not None and trace_block_index is not None:
+        stage = f"{trace_label}.adaln_input"
+        if _ltx_sampler_should_trace_block_stage(transformer_options, trace_block_index, stage):
+            _ltx_sampler_finite_trace(
+                transformer_options,
+                f"ltx_av.attention_stage.{stage}",
+                {"attn_input": attn_input, "encoder_hidden_states": encoder_hidden_states, "q_gate": q_gate},
+                {"block_index": trace_block_index, "attention": trace_label, "stage": "adaln_input"},
+            )
+    attn_out = attn(
+        attn_input,
+        context=encoder_hidden_states,
+        mask=attention_mask,
+        transformer_options=transformer_options,
+        trace_label=trace_label,
+        trace_block_index=trace_block_index,
+    )
+    if trace_label is not None and trace_block_index is not None:
+        stage = f"{trace_label}.adaln_attention_output"
+        if _ltx_sampler_should_trace_block_stage(transformer_options, trace_block_index, stage):
+            _ltx_sampler_finite_trace(
+                transformer_options,
+                f"ltx_av.attention_stage.{stage}",
+                {"attn_out": attn_out, "q_gate": q_gate},
+                {"block_index": trace_block_index, "attention": trace_label, "stage": "adaln_attention_output"},
+            )
+    out = attn_out * q_gate
+    if trace_label is not None and trace_block_index is not None:
+        stage = f"{trace_label}.adaln_gate_output"
+        if _ltx_sampler_should_trace_block_stage(transformer_options, trace_block_index, stage):
+            _ltx_sampler_finite_trace(
+                transformer_options,
+                f"ltx_av.attention_stage.{stage}",
+                {"out": out, "q_gate": q_gate},
+                {"block_index": trace_block_index, "attention": trace_label, "stage": "adaln_gate_output"},
+            )
+    return out
 
 def get_fractional_positions(indices_grid, max_pos):
     n_pos_dims = indices_grid.shape[1]
@@ -970,19 +1127,43 @@ class LTXBaseModel(torch.nn.Module, ABC):
         merged_args = {**transformer_options, **kwargs}
         x, pixel_coords, additional_args = self._process_input(x, keyframe_idxs, denoise_mask, **merged_args)
         merged_args.update(additional_args)
+        _ltx_sampler_finite_trace(
+            transformer_options,
+            "ltx_model.after_process_input",
+            {"x": x, "pixel_coords": pixel_coords},
+            {"model_class": type(self).__name__},
+        )
 
         # Prepare timestep and context
         timestep, embedded_timestep, prompt_timestep = self._prepare_timestep(timestep, batch_size, input_dtype, **merged_args)
         merged_args["prompt_timestep"] = prompt_timestep
         context, attention_mask = self._prepare_context(context, batch_size, x, attention_mask)
+        _ltx_sampler_finite_trace(
+            transformer_options,
+            "ltx_model.after_prepare_context",
+            {"x": x, "context": context, "attention_mask": attention_mask},
+            {"model_class": type(self).__name__},
+        )
 
         # Prepare attention mask and positional embeddings
         attention_mask = self._prepare_attention_mask(attention_mask, input_dtype)
         pe = self._prepare_positional_embeddings(pixel_coords, frame_rate, input_dtype)
+        _ltx_sampler_finite_trace(
+            transformer_options,
+            "ltx_model.after_prepare_pe",
+            {"x": x, "attention_mask": attention_mask, "pe": pe},
+            {"model_class": type(self).__name__},
+        )
 
         # Build self-attention mask for per-guide attenuation
         self_attention_mask = self._build_guide_self_attention_mask(
             x, transformer_options, merged_args
+        )
+        _ltx_sampler_finite_trace(
+            transformer_options,
+            "ltx_model.after_self_attention_mask",
+            {"x": x, "self_attention_mask": self_attention_mask},
+            {"model_class": type(self).__name__},
         )
 
         # Process transformer blocks
@@ -992,9 +1173,21 @@ class LTXBaseModel(torch.nn.Module, ABC):
             self_attention_mask=self_attention_mask,
             **merged_args,
         )
+        _ltx_sampler_finite_trace(
+            transformer_options,
+            "ltx_model.after_transformer_blocks",
+            {"x": x},
+            {"model_class": type(self).__name__},
+        )
 
         # Process output
         x = self._process_output(x, embedded_timestep, keyframe_idxs, **merged_args)
+        _ltx_sampler_finite_trace(
+            transformer_options,
+            "ltx_model.after_process_output",
+            {"x": x},
+            {"model_class": type(self).__name__},
+        )
         return x
 
 

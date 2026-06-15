@@ -8,6 +8,7 @@ from comfy import sd1_clip
 import comfy.model_management
 from comfy.ldm.modules.attention import optimized_attention_for_device
 from comfy.rmsnorm import rms_norm
+from comfy.backends.benchmark_stats import elapsed_seconds, now, write_event
 from comfy.text_encoders.llama import RMSNorm, MLP, BaseLlama, BaseGenerate, _make_scaled_embedding
 
 
@@ -29,6 +30,8 @@ class Gemma4Config:
     num_hidden_layers: int = 42
     num_attention_heads: int = 8
     num_key_value_heads: int = 2
+    num_global_key_value_heads: int = 2
+    attention_k_eq_v: bool = False
     max_position_embeddings: int = 131072
     rms_norm_eps: float = 1e-6
     rope_theta = [1000000.0, 10000.0]
@@ -61,6 +64,7 @@ class Gemma4_E2B_Config(Gemma4Config):
     intermediate_size: int = 6144
     num_hidden_layers: int = 35
     num_key_value_heads: int = 1
+    num_global_key_value_heads: int = 1
     sliding_attention = [512, 512, 512, 512, False]
     num_kv_shared_layers: int = 20
     use_double_wide_mlp: bool = True
@@ -72,6 +76,8 @@ class Gemma4_31B_Config(Gemma4Config):
     num_hidden_layers: int = 60
     num_attention_heads: int = 32
     num_key_value_heads: int = 16
+    num_global_key_value_heads: int = 4
+    attention_k_eq_v: bool = True
     sliding_attention = [1024, 1024, 1024, 1024, 1024, False]
     hidden_size_per_layer_input: int = 0
     num_kv_shared_layers: int = 0
@@ -88,18 +94,26 @@ def _apply_rotary_pos_emb(x, freqs_cis):
     out[..., half:] += x[..., :half] * sin[..., half:]
     return out
 
+
+def _module_device(module, fallback):
+    try:
+        return next(module.parameters()).device
+    except Exception:
+        return fallback
+
 class Gemma4Attention(nn.Module):
-    def __init__(self, config, head_dim, device=None, dtype=None, ops=None):
+    def __init__(self, config, head_dim, use_alternative_attention=False, device=None, dtype=None, ops=None):
         super().__init__()
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        self.use_alternative_attention = use_alternative_attention
+        self.num_kv_heads = config.num_global_key_value_heads if self.use_alternative_attention else config.num_key_value_heads
         self.hidden_size = config.hidden_size
         self.head_dim = head_dim
         self.inner_size = self.num_heads * head_dim
 
         self.q_proj = ops.Linear(config.hidden_size, self.inner_size, bias=config.qkv_bias, device=device, dtype=dtype)
         self.k_proj = ops.Linear(config.hidden_size, self.num_kv_heads * head_dim, bias=config.qkv_bias, device=device, dtype=dtype)
-        self.v_proj = ops.Linear(config.hidden_size, self.num_kv_heads * head_dim, bias=config.qkv_bias, device=device, dtype=dtype)
+        self.v_proj = None if self.use_alternative_attention else ops.Linear(config.hidden_size, self.num_kv_heads * head_dim, bias=config.qkv_bias, device=device, dtype=dtype)
         self.o_proj = ops.Linear(self.inner_size, config.hidden_size, bias=False, device=device, dtype=dtype)
 
         self.q_norm = None
@@ -133,7 +147,7 @@ class Gemma4Attention(nn.Module):
             shareable_kv = None
         else:
             xk = self.k_proj(hidden_states).view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
-            xv = self.v_proj(hidden_states).view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
+            xv = xk if self.v_proj is None else self.v_proj(hidden_states).view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
             if self.k_norm is not None:
                 xk = self.k_norm(xk)
             xv = rms_norm(xv)
@@ -186,7 +200,8 @@ class TransformerBlockGemma4(nn.Module):
 
         head_dim = config.head_dim if self.sliding_attention else config.global_head_dim
 
-        self.self_attn = Gemma4Attention(config, head_dim=head_dim, device=device, dtype=dtype, ops=ops)
+        use_alternative_attention = bool(getattr(config, "attention_k_eq_v", False)) and not self.sliding_attention
+        self.self_attn = Gemma4Attention(config, head_dim=head_dim, use_alternative_attention=use_alternative_attention, device=device, dtype=dtype, ops=ops)
 
         num_kv_shared = config.num_kv_shared_layers
         first_kv_shared = config.num_hidden_layers - num_kv_shared
@@ -307,7 +322,7 @@ class Gemma4Transformer(nn.Module):
 
     def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None,
                 final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=None,
-                past_key_values=None, input_ids=None):
+                past_key_values=None, input_ids=None, return_shared_kv_states=False):
         if embeds is not None:
             x = embeds
         else:
@@ -330,8 +345,8 @@ class Gemma4Transformer(nn.Module):
             mask = mask.masked_fill(mask.to(torch.bool), min_val)
 
         if seq_len > 1:
-            causal_mask = torch.zeros(past_len + seq_len, past_len + seq_len, dtype=x.dtype, device=x.device)
-            causal_mask.masked_fill_(torch.ones_like(causal_mask, dtype=torch.bool).triu_(1), min_val)
+            causal_mask = torch.zeros(seq_len, past_len + seq_len, dtype=x.dtype, device=x.device)
+            causal_mask.masked_fill_(torch.ones_like(causal_mask, dtype=torch.bool).triu_(past_len + 1), min_val)
             mask = mask + causal_mask if mask is not None else causal_mask
 
         # Per-layer inputs
@@ -385,8 +400,16 @@ class Gemma4Transformer(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
 
+        shared_kv_states = {
+            "full_attention": shared_global_kv,
+            "sliding_attention": shared_sliding_kv,
+        }
         if len(next_key_values) > 0:
+            if return_shared_kv_states:
+                return x, intermediate, next_key_values, shared_kv_states
             return x, intermediate, next_key_values
+        if return_shared_kv_states:
+            return x, intermediate, shared_kv_states
         return x, intermediate
 
 
@@ -405,6 +428,197 @@ class Gemma4Base(BaseLlama, BaseGenerate, torch.nn.Module):
         if cap:
             logits = cap * torch.tanh(logits / cap)
         return logits
+
+    def logits_for_hidden(self, x):
+        module = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
+        offload_stream = None
+        if module.comfy_cast_weights:
+            weight, _, offload_stream = comfy.ops.cast_bias_weight(module, x, offloadable=True)
+        else:
+            weight = self.model.embed_tokens.weight.to(x)
+        logits = torch.nn.functional.linear(x, weight, None)
+        comfy.ops.uncast_bias_weight(module, weight, None, offload_stream)
+        cap = self.model.config.final_logit_softcapping
+        if cap:
+            logits = cap * torch.tanh(logits / cap)
+        return logits
+
+    def generate_with_assistant(self, embeds, initial_input_ids, assistant_model, max_speculative_tokens=4, max_length=256, seed=None, stop_tokens=None, execution_dtype=None):
+        if stop_tokens is None:
+            stop_tokens = self.model.config.stop_tokens
+        device = embeds.device
+        if execution_dtype is None:
+            if comfy.model_management.should_use_bf16(device):
+                execution_dtype = torch.bfloat16
+            else:
+                execution_dtype = torch.float32
+        embeds = embeds.to(execution_dtype)
+        if embeds.ndim == 2:
+            embeds = embeds.unsqueeze(0)
+        if initial_input_ids is None:
+            raise RuntimeError("Gemma 4 assistant MTP requires target input token ids.")
+        if initial_input_ids.ndim == 1:
+            initial_input_ids = initial_input_ids.unsqueeze(0)
+
+        max_cache_len = embeds.shape[1] + max_length + max(1, int(max_speculative_tokens))
+        past_key_values = self.init_kv_cache(embeds.shape[0], max_cache_len, device, execution_dtype)
+        generated_token_ids = []
+
+        target_start = now()
+        x, _, past_key_values, shared_kv_states = self.model.forward(
+            None,
+            embeds=embeds,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            input_ids=initial_input_ids,
+            return_shared_kv_states=True,
+        )
+        current_next_logits = self.logits_for_hidden(x[:, -1:])[:, -1]
+        last_hidden_state = x[:, -1:]
+        current_input_ids = initial_input_ids
+        target_seconds = elapsed_seconds(target_start)
+        draft_seconds = 0.0
+        verify_seconds = 0.0
+        accepted_drafts = 0
+        drafted_tokens = 0
+        rejected_drafts = 0
+
+        while len(generated_token_ids) < max_length:
+            draft_start = now()
+            draft_ids = self._draft_gemma4_assistant_tokens(
+                assistant_model=assistant_model,
+                shared_kv_states=shared_kv_states,
+                last_hidden_state=last_hidden_state,
+                last_token_id=current_input_ids[:, -1:],
+                max_new_tokens=min(max_speculative_tokens, max_length - len(generated_token_ids)),
+                attention_mask=None,
+            )
+            draft_seconds += elapsed_seconds(draft_start)
+            if draft_ids.numel() == 0:
+                next_token = torch.argmax(current_next_logits, dim=-1, keepdim=True)
+                draft_ids = next_token
+            drafted_tokens += int(draft_ids.shape[1])
+
+            verify_start = now()
+            past_before_verify = past_key_values
+            verify_embeds = self.model.embed_tokens(draft_ids).to(execution_dtype)
+            verify_x, _, verify_past, verify_shared = self.model.forward(
+                None,
+                embeds=verify_embeds,
+                attention_mask=None,
+                past_key_values=past_key_values,
+                input_ids=draft_ids,
+                return_shared_kv_states=True,
+            )
+            verify_logits = self.logits_for_hidden(verify_x)
+            verify_predictions = torch.argmax(
+                torch.cat([current_next_logits[:, None, :], verify_logits[:, :-1, :]], dim=1),
+                dim=-1,
+            )
+            matches = (verify_predictions == draft_ids).squeeze(0)
+            accept_count = 0
+            for item in matches.tolist():
+                if not item:
+                    break
+                accept_count += 1
+            verify_seconds += elapsed_seconds(verify_start)
+
+            for token_id in draft_ids[0, :accept_count].tolist():
+                generated_token_ids.append(int(token_id))
+                accepted_drafts += 1
+                if token_id in stop_tokens or len(generated_token_ids) >= max_length:
+                    break
+            if generated_token_ids and generated_token_ids[-1] in stop_tokens:
+                past_key_values = verify_past
+                shared_kv_states = verify_shared
+                last_hidden_state = verify_x[:, max(accept_count - 1, 0):accept_count]
+                break
+            if len(generated_token_ids) >= max_length:
+                past_key_values = verify_past
+                shared_kv_states = verify_shared
+                last_hidden_state = verify_x[:, -1:]
+                break
+
+            if accept_count == draft_ids.shape[1]:
+                past_key_values = verify_past
+                shared_kv_states = verify_shared
+                last_hidden_state = verify_x[:, -1:]
+                current_input_ids = torch.cat([current_input_ids, draft_ids], dim=1)
+                current_next_logits = verify_logits[:, -1]
+                continue
+
+            rejected_drafts += int(draft_ids.shape[1] - accept_count)
+            verifier_token = verify_predictions[:, accept_count:accept_count + 1]
+            generated_token_ids.append(int(verifier_token[0, 0].item()))
+            rebuild_ids = torch.cat([draft_ids[:, :accept_count], verifier_token], dim=1)
+            rebuild_start = now()
+            rebuild_embeds = self.model.embed_tokens(rebuild_ids).to(execution_dtype)
+            x, _, past_key_values, shared_kv_states = self.model.forward(
+                None,
+                embeds=rebuild_embeds,
+                attention_mask=None,
+                past_key_values=past_before_verify,
+                input_ids=rebuild_ids,
+                return_shared_kv_states=True,
+            )
+            target_seconds += elapsed_seconds(rebuild_start)
+            current_input_ids = torch.cat([current_input_ids, rebuild_ids], dim=1)
+            current_next_logits = self.logits_for_hidden(x[:, -1:])[:, -1]
+            last_hidden_state = x[:, -1:]
+            if int(verifier_token[0, 0].item()) in stop_tokens:
+                break
+
+        write_event(
+            "textgen_gemma4_assistant_mtp_end",
+            backend="torch",
+            generation_mode="torch_gemma4_assistant_mtp",
+            requested_speculative_depth=int(max_speculative_tokens),
+            drafted_tokens=drafted_tokens,
+            accepted_drafts=accepted_drafts,
+            rejected_drafts=rejected_drafts,
+            acceptance_rate=round(accepted_drafts / drafted_tokens, 6) if drafted_tokens else None,
+            target_time_s=target_seconds,
+            draft_time_s=draft_seconds,
+            verify_time_s=verify_seconds,
+            output_tokens=len(generated_token_ids),
+            torch_device=str(device),
+        )
+        return generated_token_ids
+
+    def _draft_gemma4_assistant_tokens(self, assistant_model, shared_kv_states, last_hidden_state, last_token_id, max_new_tokens, attention_mask=None):
+        drafted = []
+        current_hidden = last_hidden_state
+        current_token = last_token_id
+        assistant_device = _module_device(assistant_model, last_hidden_state.device)
+        position_ids = torch.tensor([[max(0, shared_kv_states["full_attention"][0].shape[2] - 1)]], dtype=torch.long, device=assistant_device)
+        sequence_stopped = False
+        for _ in range(int(max_new_tokens)):
+            last_token_embedding = self.model.embed_tokens(current_token.to(last_hidden_state.device)).to(current_hidden.dtype)
+            assistant_dtype = next(assistant_model.parameters()).dtype
+            inputs_embeds = torch.cat([last_token_embedding, current_hidden], dim=-1).to(device=assistant_device, dtype=assistant_dtype)
+            assistant_shared = {
+                key: (value[0].to(device=assistant_device, dtype=assistant_dtype), value[1].to(device=assistant_device, dtype=assistant_dtype))
+                for key, value in shared_kv_states.items()
+                if value is not None
+            }
+            with torch.no_grad():
+                outputs = assistant_model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    shared_kv_states=assistant_shared,
+                    use_cache=False,
+                )
+            current_token = outputs.logits.argmax(dim=-1).to(last_hidden_state.device)
+            current_hidden = outputs.last_hidden_state.to(last_hidden_state.device)
+            drafted.append(current_token)
+            if int(current_token[0, 0].item()) in self.model.config.stop_tokens:
+                sequence_stopped = True
+            if sequence_stopped:
+                break
+        if not drafted:
+            return torch.empty((last_token_id.shape[0], 0), dtype=last_token_id.dtype, device=last_token_id.device)
+        return torch.cat(drafted, dim=1)
 
     def init_kv_cache(self, batch, max_cache_len, device, execution_dtype):
         past_key_values = []
@@ -1257,6 +1471,36 @@ class Gemma4Model(sd1_clip.SDClipModel):
         initial_token_ids = [ids]
         input_ids = torch.tensor(initial_token_ids, device=self.execution_device)
         return self.transformer.generate(embeds, do_sample, max_length, temperature, top_k, top_p, min_p, repetition_penalty, seed, initial_tokens=initial_token_ids[0], presence_penalty=presence_penalty, initial_input_ids=input_ids)
+
+    def generate_with_gemma4_assistant(self, tokens, assistant_model, max_speculative_tokens=4, max_length=256, temperature=0.0, top_k=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0, seed=None, presence_penalty=0.0):
+        if temperature not in (0, 0.0) or top_p != 1.0 or min_p != 0.0 or repetition_penalty != 1.0 or presence_penalty != 0.0:
+            raise RuntimeError("Gemma 4 assistant MTP currently supports greedy TextGenerate only.")
+        if isinstance(tokens, dict):
+            tokens = next(iter(tokens.values()))
+        tokens_only = [[t[0] for t in b] for b in tokens]
+        embeds, _, _, embeds_info = sd1_clip.SDClipModel.process_tokens(self, tokens_only, self.execution_device)
+        seq_len = embeds.shape[1]
+        ids = [0] * seq_len
+        expanded_idx = 0
+        embed_map = {info["index"]: info["size"] for info in embeds_info}
+        for t in tokens_only[0]:
+            if expanded_idx in embed_map:
+                expanded_idx += embed_map[expanded_idx]
+            elif isinstance(t, int):
+                if expanded_idx < seq_len:
+                    ids[expanded_idx] = t
+                expanded_idx += 1
+            else:
+                expanded_idx += 1
+        input_ids = torch.tensor([ids], device=self.execution_device)
+        return self.transformer.generate_with_assistant(
+            embeds,
+            input_ids,
+            assistant_model=assistant_model,
+            max_speculative_tokens=max_speculative_tokens,
+            max_length=max_length,
+            seed=seed,
+        )
 
 
 def gemma4_te(dtype_llama=None, llama_quantization_metadata=None, model_class=None):

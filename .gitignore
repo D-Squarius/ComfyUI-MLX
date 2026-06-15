@@ -13,6 +13,7 @@ extra_model_paths.yaml
 .idea/
 venv*/
 .venv/
+.venv*/
 /web/extensions/*
 !/web/extensions/logging.js.example
 !/web/extensions/core/
@@ -24,3 +25,15 @@ web_custom_versions/
 filtered-openapi.yaml
 uv.lock
 .comfy_environment
+
+# Local benchmark/runtime artifacts for ComfyUI-MLX development.
+/benchmarks/
+/benchmarks/mlx_vs_baselines/results/
+/benchmarks/mlx_vs_baselines/custom_mlx_wheel_venvs/
+/benchmarks/mlx_vs_baselines/native/build/
+/benchmarks/mlx_vs_baselines/**/*.trace
+/benchmarks/mlx_vs_baselines/**/*.xcresult
+/benchmarks/mlx_vs_baselines/**/*.mp4
+/benchmarks/mlx_vs_baselines/**/*.mov
+/benchmarks/mlx_vs_baselines/**/*.sqlite3
+/Vendor/

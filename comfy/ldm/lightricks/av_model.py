@@ -12,6 +12,8 @@ from comfy.ldm.lightricks.model import (
     LTXVModel,
     apply_cross_attention_adaln,
     compute_prompt_timestep,
+    _ltx_sampler_finite_trace,
+    _ltx_sampler_should_trace_block_stage,
 )
 from comfy.ldm.lightricks.symmetric_patchifier import AudioPatchifier
 from comfy.ldm.lightricks.embeddings_connector import Embeddings1DConnector
@@ -237,6 +239,7 @@ class BasicAVTransformerBlock(nn.Module):
     def _apply_text_cross_attention(
         self, x, context, attn, scale_shift_table, prompt_scale_shift_table,
         timestep, prompt_timestep, attention_mask, transformer_options,
+        trace_block_index=None, trace_label=None,
     ):
         """Apply text cross-attention, with optional ADaLN modulation."""
         if self.cross_attention_adaln:
@@ -247,18 +250,36 @@ class BasicAVTransformerBlock(nn.Module):
                 x, context, attn, shift_q, scale_q, gate,
                 prompt_scale_shift_table, prompt_timestep,
                 attention_mask, transformer_options,
+                trace_label=trace_label,
+                trace_block_index=trace_block_index,
             )
         return attn(
             comfy.ldm.common_dit.rms_norm(x), context=context,
             mask=attention_mask, transformer_options=transformer_options,
+            trace_label=trace_label,
+            trace_block_index=trace_block_index,
         )
 
     def forward(
         self, x: Tuple[torch.Tensor, torch.Tensor], v_context=None, a_context=None, attention_mask=None, v_timestep=None, a_timestep=None,
         v_pe=None, a_pe=None, v_cross_pe=None, a_cross_pe=None, v_cross_scale_shift_timestep=None, a_cross_scale_shift_timestep=None,
         v_cross_gate_timestep=None, a_cross_gate_timestep=None, transformer_options=None, self_attention_mask=None,
-        v_prompt_timestep=None, a_prompt_timestep=None,
+        v_prompt_timestep=None, a_prompt_timestep=None, trace_block_index=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if transformer_options is None:
+            transformer_options = {}
+
+        def trace_stage(stage, tensors):
+            if trace_block_index is None:
+                return
+            if _ltx_sampler_should_trace_block_stage(transformer_options, trace_block_index, stage):
+                _ltx_sampler_finite_trace(
+                    transformer_options,
+                    f"ltx_av.block_stage.{stage}",
+                    tensors,
+                    {"block_index": trace_block_index, "stage": stage},
+                )
+
         run_vx = transformer_options.get("run_vx", True)
         run_ax = transformer_options.get("run_ax", True)
 
@@ -266,42 +287,75 @@ class BasicAVTransformerBlock(nn.Module):
         run_ax = run_ax and ax.numel() > 0
         run_a2v = run_vx and transformer_options.get("a2v_cross_attn", True) and ax.numel() > 0
         run_v2a = run_ax and transformer_options.get("v2a_cross_attn", True)
+        trace_stage(
+            "block_input",
+            {
+                "video": vx,
+                "audio": ax,
+                "v_context": v_context,
+                "a_context": a_context,
+                "attention_mask": attention_mask,
+                "self_attention_mask": self_attention_mask,
+                "v_timestep": v_timestep,
+                "a_timestep": a_timestep,
+                "v_pe": v_pe,
+                "a_pe": a_pe,
+                "v_cross_pe": v_cross_pe,
+                "a_cross_pe": a_cross_pe,
+            },
+        )
 
         # video
         if run_vx:
             # video self-attention
             vshift_msa, vscale_msa = (self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(0, 2)))
             norm_vx = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_msa) + vshift_msa
+            trace_stage("video_norm_mod", {"norm_vx": norm_vx, "shift": vshift_msa, "scale": vscale_msa})
             del vshift_msa, vscale_msa
             attn1_out = self.attn1(norm_vx, pe=v_pe, mask=self_attention_mask, transformer_options=transformer_options)
+            trace_stage("video_attn1_output", {"attn1_out": attn1_out})
             del norm_vx
             # video cross-attention
             vgate_msa = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(2, 3))[0]
             vx.addcmul_(attn1_out, vgate_msa)
+            trace_stage("video_self_residual", {"video": vx, "gate": vgate_msa})
             del vgate_msa, attn1_out
-            vx.add_(self._apply_text_cross_attention(
+            video_text_out = self._apply_text_cross_attention(
                 vx, v_context, self.attn2, self.scale_shift_table,
                 getattr(self, 'prompt_scale_shift_table', None),
-                v_timestep, v_prompt_timestep, attention_mask, transformer_options,)
+                v_timestep, v_prompt_timestep, attention_mask, transformer_options,
             )
+            trace_stage("video_text_cross_attn_output", {"video_text_out": video_text_out})
+            vx.add_(video_text_out)
+            trace_stage("video_text_residual", {"video": vx})
+            del video_text_out
 
         # audio
         if run_ax:
             # audio self-attention
             ashift_msa, ascale_msa = (self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(0, 2)))
             norm_ax = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_msa) + ashift_msa
+            trace_stage("audio_norm_mod", {"norm_ax": norm_ax, "shift": ashift_msa, "scale": ascale_msa})
             del ashift_msa, ascale_msa
             attn1_out = self.audio_attn1(norm_ax, pe=a_pe, transformer_options=transformer_options)
+            trace_stage("audio_attn1_output", {"attn1_out": attn1_out})
             del norm_ax
             # audio cross-attention
             agate_msa = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(2, 3))[0]
             ax.addcmul_(attn1_out, agate_msa)
+            trace_stage("audio_self_residual", {"audio": ax, "gate": agate_msa})
             del agate_msa, attn1_out
-            ax.add_(self._apply_text_cross_attention(
+            audio_text_out = self._apply_text_cross_attention(
                 ax, a_context, self.audio_attn2, self.audio_scale_shift_table,
                 getattr(self, 'audio_prompt_scale_shift_table', None),
-                a_timestep, a_prompt_timestep, attention_mask, transformer_options,)
+                a_timestep, a_prompt_timestep, attention_mask, transformer_options,
+                trace_block_index=trace_block_index,
+                trace_label="audio_text_cross_attention",
             )
+            trace_stage("audio_text_cross_attn_output", {"audio_text_out": audio_text_out})
+            ax.add_(audio_text_out)
+            trace_stage("audio_text_residual", {"audio": ax})
+            del audio_text_out
 
         # video - audio cross attention.
         if run_a2v or run_v2a:
@@ -317,13 +371,16 @@ class BasicAVTransformerBlock(nn.Module):
 
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_a2v_v) + shift_ca_video_hidden_states_a2v_v
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
+                trace_stage("a2v_scaled_inputs", {"video_scaled": vx_scaled, "audio_scaled": ax_scaled})
                 del scale_ca_video_hidden_states_a2v_v, shift_ca_video_hidden_states_a2v_v, scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v
 
                 a2v_out = self.audio_to_video_attn(vx_scaled, context=ax_scaled, pe=v_cross_pe, k_pe=a_cross_pe, transformer_options=transformer_options)
+                trace_stage("a2v_attn_output", {"a2v_out": a2v_out})
                 del vx_scaled, ax_scaled
 
                 gate_out_a2v = self.get_ada_values(self.scale_shift_table_a2v_ca_video[4:, :], vx.shape[0], v_cross_gate_timestep)[0]
                 vx.addcmul_(a2v_out, gate_out_a2v)
+                trace_stage("a2v_residual", {"video": vx, "gate": gate_out_a2v})
                 del gate_out_a2v, a2v_out
 
             # video to audio cross attention
@@ -335,13 +392,16 @@ class BasicAVTransformerBlock(nn.Module):
 
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
+                trace_stage("v2a_scaled_inputs", {"audio_scaled": ax_scaled, "video_scaled": vx_scaled})
                 del scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a, scale_ca_audio_hidden_states_v2a, shift_ca_audio_hidden_states_v2a
 
                 v2a_out = self.video_to_audio_attn(ax_scaled, context=vx_scaled, pe=a_cross_pe, k_pe=v_cross_pe, transformer_options=transformer_options)
+                trace_stage("v2a_attn_output", {"v2a_out": v2a_out})
                 del ax_scaled, vx_scaled
 
                 gate_out_v2a = self.get_ada_values(self.scale_shift_table_a2v_ca_audio[4:, :], ax.shape[0], a_cross_gate_timestep)[0]
                 ax.addcmul_(v2a_out, gate_out_v2a)
+                trace_stage("v2a_residual", {"audio": ax, "gate": gate_out_v2a})
                 del gate_out_v2a, v2a_out
 
             del vx_norm3, ax_norm3
@@ -350,28 +410,35 @@ class BasicAVTransformerBlock(nn.Module):
         if run_vx:
             vshift_mlp, vscale_mlp = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(3, 5))
             vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_mlp) + vshift_mlp
+            trace_stage("video_ffn_scaled_input", {"video_scaled": vx_scaled, "shift": vshift_mlp, "scale": vscale_mlp})
             del vshift_mlp, vscale_mlp
 
             ff_out = self.ff(vx_scaled)
+            trace_stage("video_ffn_output", {"ff_out": ff_out})
             del vx_scaled
 
             vgate_mlp = self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(5, 6))[0]
             vx.addcmul_(ff_out, vgate_mlp)
+            trace_stage("video_ffn_residual", {"video": vx, "gate": vgate_mlp})
             del vgate_mlp, ff_out
 
         # audio feedforward
         if run_ax:
             ashift_mlp, ascale_mlp = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(3, 5))
             ax_scaled = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_mlp) + ashift_mlp
+            trace_stage("audio_ffn_scaled_input", {"audio_scaled": ax_scaled, "shift": ashift_mlp, "scale": ascale_mlp})
             del ashift_mlp, ascale_mlp
 
             ff_out = self.audio_ff(ax_scaled)
+            trace_stage("audio_ffn_output", {"ff_out": ff_out})
             del ax_scaled
 
             agate_mlp = self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(5, 6))[0]
             ax.addcmul_(ff_out, agate_mlp)
+            trace_stage("audio_ffn_residual", {"audio": ax, "gate": agate_mlp})
             del agate_mlp, ff_out
 
+        trace_stage("block_output", {"video": vx, "audio": ax})
         return vx, ax
 
 
@@ -914,6 +981,12 @@ class LTXAVModel(LTXVModel):
 
         # Process transformer blocks
         for i, block in enumerate(self.transformer_blocks):
+            _ltx_sampler_finite_trace(
+                transformer_options,
+                "ltx_av.transformer_block.input",
+                {"video": vx, "audio": ax},
+                {"block_index": i},
+            )
             comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, vx.device, block)
             if ("double_block", i) in blocks_replace:
 
@@ -938,6 +1011,7 @@ class LTXAVModel(LTXVModel):
                         self_attention_mask=args.get("self_attention_mask"),
                         v_prompt_timestep=args.get("v_prompt_timestep"),
                         a_prompt_timestep=args.get("a_prompt_timestep"),
+                        trace_block_index=i,
                     )
                     return out
 
@@ -962,7 +1036,7 @@ class LTXAVModel(LTXVModel):
                         "v_prompt_timestep": v_prompt_timestep,
                         "a_prompt_timestep": a_prompt_timestep,
                     },
-                    {"original_block": block_wrap},
+                    {"original_block": block_wrap, "torch_block": block},
                 )
                 vx, ax = out["img"]
             else:
@@ -985,7 +1059,15 @@ class LTXAVModel(LTXVModel):
                     self_attention_mask=self_attention_mask,
                     v_prompt_timestep=v_prompt_timestep,
                     a_prompt_timestep=a_prompt_timestep,
+                    trace_block_index=i,
                 )
+
+            _ltx_sampler_finite_trace(
+                transformer_options,
+                "ltx_av.transformer_block.output",
+                {"video": vx, "audio": ax},
+                {"block_index": i},
+            )
 
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, vx.device, None)
 
@@ -996,6 +1078,11 @@ class LTXAVModel(LTXVModel):
         ax = x[1]
         v_embedded_timestep = embedded_timestep[0]
         a_embedded_timestep = embedded_timestep[1]
+        _ltx_sampler_finite_trace(
+            kwargs,
+            "ltx_av.process_output.start",
+            {"video": vx, "audio": ax},
+        )
 
         # Trim reference audio tokens before unpatchification
         ref_audio_seq_len = kwargs.get("ref_audio_seq_len", 0)
@@ -1028,7 +1115,13 @@ class LTXAVModel(LTXVModel):
 
         # Recombine audio and video
         original_shape = kwargs.get("av_orig_shape")
-        return self.recombine_audio_and_video_latents(vx, ax, original_shape)
+        out = self.recombine_audio_and_video_latents(vx, ax, original_shape)
+        _ltx_sampler_finite_trace(
+            kwargs,
+            "ltx_av.process_output.end",
+            {"output": out},
+        )
+        return out
 
     def forward(
         self,

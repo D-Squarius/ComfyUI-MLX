@@ -39,6 +39,14 @@ class LTXVLatentUpsampler:
         Returns:
             tuple: Tuple containing the upsampled latent
         """
+        try:
+            from comfy.backends.mlx_ltx_backend import is_mlx_ltx_latent_upscaler, run_mlx_ltx_latent_upscale
+
+            if is_mlx_ltx_latent_upscaler(upscale_model):
+                return (run_mlx_ltx_latent_upscale(upscale_model, samples),)
+        except ImportError:
+            pass
+
         device = model_management.get_torch_device()
         memory_required = model_management.module_size(upscale_model)
 

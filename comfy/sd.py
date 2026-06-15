@@ -290,6 +290,7 @@ class CLIP:
         n.tokenizer_options = self.tokenizer_options.copy()
         n.use_clip_schedule = self.use_clip_schedule
         n.apply_hooks_to_conds = self.apply_hooks_to_conds
+        n.textgen_accelerator = getattr(self, "textgen_accelerator", None)
         return n
 
     def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
@@ -448,7 +449,26 @@ class CLIP:
         self.load_model(tokens)
         self.cond_stage_model.set_clip_options({"layer": None})
         self.cond_stage_model.set_clip_options({"execution_device": self.patcher.load_device})
-        return self.cond_stage_model.generate(tokens, do_sample=do_sample, max_length=max_length, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, repetition_penalty=repetition_penalty, seed=seed, presence_penalty=presence_penalty)
+        original_generate = lambda: self.cond_stage_model.generate(tokens, do_sample=do_sample, max_length=max_length, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p, repetition_penalty=repetition_penalty, seed=seed, presence_penalty=presence_penalty)
+        accelerator = getattr(self, "textgen_accelerator", None)
+        if accelerator is not None:
+            return accelerator.generate(
+                original_generate,
+                tokens=tokens,
+                do_sample=do_sample,
+                max_length=max_length,
+                runtime_model=self.cond_stage_model,
+                sampler={
+                    "temperature": temperature,
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "min_p": min_p,
+                    "repetition_penalty": repetition_penalty,
+                    "presence_penalty": presence_penalty,
+                    "seed": seed,
+                },
+            )
+        return original_generate()
 
     def decode(self, token_ids, skip_special_tokens=True):
         return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
@@ -1276,15 +1296,58 @@ def load_clip_model_patcher(ckpt_paths, embedding_directory=None, clip_type=CLIP
     clip = load_clip(ckpt_paths, embedding_directory, clip_type, model_options, disable_dynamic)
     return clip.patcher
 
+def _normalize_hf_gemma4_clip_state_dict(sd):
+    if "model.language_model.layers.0.post_feedforward_layernorm.weight" not in sd:
+        return sd
+    converted = {}
+    for key, value in sd.items():
+        if key.startswith("model.language_model."):
+            key = "model." + key[len("model.language_model."):]
+        elif key.startswith("model.vision_tower."):
+            key = "vision_model." + key[len("model.vision_tower."):]
+        elif key.startswith("model.audio_tower."):
+            key = "audio_model." + key[len("model.audio_tower."):]
+        elif key.startswith("model.embed_vision."):
+            key = "multi_modal_projector." + key[len("model.embed_vision."):]
+        elif key.startswith("model.embed_audio."):
+            key = "audio_projector." + key[len("model.embed_audio."):]
+        converted[key] = value
+    return converted
+
+
 def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}, disable_dynamic=False):
+    model_options = dict(model_options)
+    if len(ckpt_paths) == 1:
+        try:
+            from comfy.text_encoders.acceleration import apply_clip_model_options_for_sidecar
+
+            model_options = apply_clip_model_options_for_sidecar(ckpt_paths[0], model_options)
+        except Exception as e:
+            logging.warning("TextGenerate acceleration load options were ignored: %s", e)
     clip_data = []
     for p in ckpt_paths:
         sd, metadata = comfy.utils.load_torch_file(p, safe_load=True, return_metadata=True)
+        sd = _normalize_hf_gemma4_clip_state_dict(sd)
+        if "tokenizer_json" not in sd:
+            root, _ = os.path.splitext(p)
+            for tokenizer_path in (f"{root}.tokenizer.json", os.path.join(os.path.dirname(p), "tokenizer.json")):
+                if os.path.exists(tokenizer_path):
+                    with open(tokenizer_path, "rb") as f:
+                        sd["tokenizer_json"] = torch.tensor(list(f.read()), dtype=torch.uint8)
+                    break
         if model_options.get("custom_operations", None) is None:
             sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
         clip_data.append(sd)
     clip = load_text_encoder_state_dicts(clip_data, embedding_directory=embedding_directory, clip_type=clip_type, model_options=model_options, disable_dynamic=disable_dynamic)
     clip.patcher.cached_patcher_init = (load_clip_model_patcher, (ckpt_paths, embedding_directory, clip_type, model_options))
+    try:
+        from comfy.text_encoders.acceleration import make_accelerator_for_clip
+
+        accelerator = make_accelerator_for_clip(ckpt_paths[0], clip_data[0]) if len(ckpt_paths) == 1 and len(clip_data) == 1 else None
+        if accelerator is not None:
+            clip.textgen_accelerator = accelerator
+    except Exception as e:
+        logging.warning("TextGenerate acceleration sidecar was ignored: %s", e)
     return clip
 
 
@@ -1780,6 +1843,9 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
 
     if output_model:
         inital_load_device = model_management.unet_inital_load_device(parameters, unet_dtype)
+        if os.environ.get("COMFY_BENCH_UNET_INITIAL_CPU") == "1":
+            logging.info("COMFY_BENCH_UNET_INITIAL_CPU=1: constructing diffusion model on CPU for benchmark load staging")
+            inital_load_device = torch.device("cpu")
         model = model_config.get_model(sd, diffusion_model_prefix, device=inital_load_device)
         ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
         model_patcher = ModelPatcher(model, load_device=load_device, offload_device=model_management.unet_offload_device())

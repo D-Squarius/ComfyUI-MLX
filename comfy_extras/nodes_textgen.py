@@ -42,12 +42,17 @@ class TextGenerate(io.ComfyNode):
             ],
             outputs=[
                 io.String.Output(display_name="generated_text"),
+                io.Audio.Output(display_name="generated_audio"),
             ],
         )
 
     @classmethod
-    def execute(cls, clip, prompt, max_length, sampling_mode, image=None, thinking=False, use_default_template=True, video=None, audio=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, max_length, sampling_mode=None, image=None, thinking=False, use_default_template=True, video=None, audio=None) -> io.NodeOutput:
+        for method in ("tokenize", "generate", "decode"):
+            if not hasattr(clip, method):
+                raise TypeError(f"TextGenerate requires a CLIP/text runtime implementing tokenize/generate/decode; missing {method}().")
 
+        sampling_mode = sampling_mode or {"sampling_mode": "off"}
         tokens = clip.tokenize(prompt, image=image, skip_template=not use_default_template, min_length=1, thinking=thinking, video=video, audio=audio)
 
         # Get sampling parameters from dynamic combo
@@ -74,8 +79,11 @@ class TextGenerate(io.ComfyNode):
         )
 
         generated_text = clip.decode(generated_ids)
+        generated_audio = None
+        if hasattr(clip, "decode_audio"):
+            generated_audio = clip.decode_audio(generated_ids)
 
-        return io.NodeOutput(generated_text)
+        return io.NodeOutput(generated_text, generated_audio)
 
 
 LTX2_T2V_SYSTEM_PROMPT = """You are a Creative Assistant. Given a user's raw input prompt describing a scene or concept, expand it into a detailed video generation prompt with specific visuals and integrated audio to guide a text-to-video model.
@@ -166,7 +174,7 @@ class TextGenerateLTX2Prompt(TextGenerate):
         )
 
     @classmethod
-    def execute(cls, clip, prompt, max_length, sampling_mode, image=None, thinking=False, use_default_template=True, video=None, audio=None) -> io.NodeOutput:
+    def execute(cls, clip, prompt, max_length, sampling_mode=None, image=None, thinking=False, use_default_template=True, video=None, audio=None) -> io.NodeOutput:
         if image is None:
             formatted_prompt = f"<start_of_turn>system\n{LTX2_T2V_SYSTEM_PROMPT.strip()}<end_of_turn>\n<start_of_turn>user\nUser Raw Input Prompt: {prompt}.<end_of_turn>\n<start_of_turn>model\n"
         else:

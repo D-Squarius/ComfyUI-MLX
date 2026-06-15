@@ -10,6 +10,15 @@ from collections.abc import Collection
 from comfy.cli_args import args
 
 supported_pt_extensions: set[str] = {'.ckpt', '.pt', '.pt2', '.bin', '.pth', '.safetensors', '.pkl', '.sft'}
+supported_checkpoint_extensions: set[str] = supported_pt_extensions | {'.mlx_ltx.json'}
+supported_text_encoder_extensions: set[str] = supported_pt_extensions | {
+    '.safetensors.index.json',
+    '.mlx',
+    '.mlx.json',
+    '.gguf.json',
+    '.transformers.json',
+    '.baseline.json',
+}
 
 folder_names_and_paths: dict[str, tuple[list[str], set[str]]] = {}
 
@@ -20,12 +29,12 @@ else:
     base_path = os.path.dirname(os.path.realpath(__file__))
 
 models_dir = os.path.join(base_path, "models")
-folder_names_and_paths["checkpoints"] = ([os.path.join(models_dir, "checkpoints")], supported_pt_extensions)
+folder_names_and_paths["checkpoints"] = ([os.path.join(models_dir, "checkpoints")], supported_checkpoint_extensions)
 folder_names_and_paths["configs"] = ([os.path.join(models_dir, "configs")], [".yaml"])
 
 folder_names_and_paths["loras"] = ([os.path.join(models_dir, "loras")], supported_pt_extensions)
 folder_names_and_paths["vae"] = ([os.path.join(models_dir, "vae")], supported_pt_extensions)
-folder_names_and_paths["text_encoders"] = ([os.path.join(models_dir, "text_encoders"), os.path.join(models_dir, "clip")], supported_pt_extensions)
+folder_names_and_paths["text_encoders"] = ([os.path.join(models_dir, "text_encoders"), os.path.join(models_dir, "clip")], supported_text_encoder_extensions)
 folder_names_and_paths["diffusion_models"] = ([os.path.join(models_dir, "unet"), os.path.join(models_dir, "diffusion_models")], supported_pt_extensions)
 folder_names_and_paths["clip_vision"] = ([os.path.join(models_dir, "clip_vision")], supported_pt_extensions)
 folder_names_and_paths["style_models"] = ([os.path.join(models_dir, "style_models")], supported_pt_extensions)
@@ -51,6 +60,11 @@ folder_names_and_paths["classifiers"] = ([os.path.join(models_dir, "classifiers"
 folder_names_and_paths["model_patches"] = ([os.path.join(models_dir, "model_patches")], supported_pt_extensions)
 
 folder_names_and_paths["audio_encoders"] = ([os.path.join(models_dir, "audio_encoders")], supported_pt_extensions)
+
+folder_names_and_paths["mlx"] = ([os.path.join(models_dir, "mlx")], {"folder"})
+folder_names_and_paths["mlx_ltx"] = ([os.path.join(models_dir, "mlx_ltx")], {"folder"})
+folder_names_and_paths["gguf"] = ([os.path.join(models_dir, "gguf")], {"folder"})
+folder_names_and_paths["transformers"] = ([os.path.join(models_dir, "transformers")], {"folder"})
 
 folder_names_and_paths["background_removal"] = ([os.path.join(models_dir, "background_removal")], supported_pt_extensions)
 
@@ -352,7 +366,23 @@ def recursive_search(directory: str, excluded_dir_names: list[str] | None=None) 
     return result, dirs
 
 def filter_files_extensions(files: Collection[str], extensions: Collection[str]) -> list[str]:
-    return sorted(list(filter(lambda a: os.path.splitext(a)[-1].lower() in extensions or len(extensions) == 0, files)))
+    if len(extensions) == 0:
+        return sorted(files)
+
+    normalized_extensions = {e.lower() for e in extensions}
+
+    def matches_extension(filename: str) -> bool:
+        filename_lower = filename.lower()
+        split_extension = os.path.splitext(filename_lower)[-1]
+        for extension in normalized_extensions:
+            if extension == "":
+                if split_extension == "":
+                    return True
+            elif filename_lower.endswith(extension):
+                return True
+        return False
+
+    return sorted(filter(matches_extension, files))
 
 
 
