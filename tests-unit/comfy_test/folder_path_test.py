@@ -97,7 +97,24 @@ def test_filter_files_extensions():
     files = ["file1.txt", "file2.jpg", "file3.png", "file4.txt"]
     assert folder_paths.filter_files_extensions(files, [".txt"]) == ["file1.txt", "file4.txt"]
     assert folder_paths.filter_files_extensions(files, [".jpg", ".png"]) == ["file2.jpg", "file3.png"]
+    assert folder_paths.filter_files_extensions(["model.mlx.json", "config.json"], [".mlx.json"]) == ["model.mlx.json"]
+    assert folder_paths.filter_files_extensions(["no_extension", "file.txt"], [""]) == ["no_extension"]
     assert folder_paths.filter_files_extensions(files, []) == files
+
+
+def test_text_encoder_filename_list_accepts_mlx_manifests(clear_folder_paths):
+    extensions = folder_paths.folder_names_and_paths["text_encoders"][1]
+
+    assert ".mlx" in extensions
+    assert ".mlx.json" in extensions
+    assert ".gguf.json" in extensions
+    assert ".transformers.json" in extensions
+    assert ".baseline.json" in extensions
+
+
+def test_mlx_ltx_model_folder_is_registered(clear_folder_paths):
+    assert folder_paths.get_folder_paths("mlx_ltx")[0].endswith(os.path.join("models", "mlx_ltx"))
+
 
 @patch("folder_paths.recursive_search")
 @patch("folder_paths.folder_names_and_paths")
