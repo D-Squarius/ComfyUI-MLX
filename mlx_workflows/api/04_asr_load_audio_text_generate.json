@@ -1,0 +1,34 @@
+{
+  "1": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "whisper_tiny_4bit_mlx_audio_asr.mlx.json",
+      "type": "mlx_audio_asr",
+      "device": "default"
+    }
+  },
+  "2": {
+    "class_type": "TextGenerate",
+    "inputs": {
+      "clip": ["1", 0],
+      "prompt": "",
+      "audio": ["5", 0],
+      "max_length": 64,
+      "sampling_mode": {"sampling_mode": "off"},
+      "thinking": false,
+      "use_default_template": true
+    }
+  },
+  "3": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "mlx_tts_for_asr.flac"
+    }
+  }
+}

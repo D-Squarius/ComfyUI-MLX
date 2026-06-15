@@ -1,0 +1,27 @@
+{
+  "1": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen2_5_0_5b_mlx_lm.mlx.json",
+      "type": "mlx_lm",
+      "device": "default"
+    }
+  },
+  "2": {
+    "class_type": "TextGenerate",
+    "inputs": {
+      "clip": ["1", 0],
+      "prompt": "Reply with exactly OK.",
+      "max_length": 8,
+      "sampling_mode": {"sampling_mode": "off"},
+      "thinking": false,
+      "use_default_template": true
+    }
+  },
+  "3": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": ["2", 0]
+    }
+  }
+}

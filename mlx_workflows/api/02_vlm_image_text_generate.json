@@ -1,0 +1,34 @@
+{
+  "1": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen2_vl_2b_mlx_vlm.mlx.json",
+      "type": "mlx_vlm",
+      "device": "default"
+    }
+  },
+  "2": {
+    "class_type": "TextGenerate",
+    "inputs": {
+      "clip": ["1", 0],
+      "prompt": "Describe this image in one short sentence.",
+      "image": ["5", 0],
+      "max_length": 32,
+      "sampling_mode": {"sampling_mode": "off"},
+      "thinking": false,
+      "use_default_template": true
+    }
+  },
+  "3": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "mlx_vlm_red_square.png"
+    }
+  }
+}
