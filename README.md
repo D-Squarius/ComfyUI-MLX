@@ -56,8 +56,9 @@ Keep dense Comfy weights in the normal Comfy model folders. Keep MLX packages or
 | Klein 9B MLX Q4 | [mlx-community/flux2-klein-9b-4bit](https://huggingface.co/mlx-community/flux2-klein-9b-4bit) | MLX package root used by the Klein alias |
 | Z-Image Turbo BF16 | [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo), [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | `models/diffusion_models/z_image_turbo_bf16.safetensors` or equivalent alias target |
 | LTX 2.3 stock/reference | [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | Dense Comfy files under `models/checkpoints`, `models/loras`, text encoder, VAE, and upscaler folders |
-| LTX 2.3 MLX BF16 | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) | Manifest referenced by `ltx23_dev_lora_mlx_bf16_native.mlx_ltx.json` and related local MLX model roots |
-| LTX 2.3 MLX Q8/Q4 context | [dgrauet/ltx-2.3-mlx-q8](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8), [dgrauet/ltx-2.3-mlx-q4](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) | Optional LTX quant package roots for separate context/performance testing |
+| LTX 2.3 MLX native dev+LoRA BF16 | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) plus the stock [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) BF16 dev checkpoint and distilled LoRA | Manifest such as `ltx23_dev_lora_mlx_bf16_native.mlx_ltx.json`; uses `pipeline: dev_lora`, `ltx-2.3-22b-dev.safetensors`, and LoRA strength `0.5` |
+| LTX 2.3 MLX distilled BF16 context | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) | Distilled package folder containing `transformer-distilled-1.1.safetensors`, VAE/audio/vocoder/connector files, and x2 upscaler files |
+| LTX 2.3 MLX distilled Q8/Q4 context | [dgrauet/ltx-2.3-mlx-q8](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8), [dgrauet/ltx-2.3-mlx-q4](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) | Optional quantized distilled package roots with the same folder layout as the BF16 distilled package |
 
 More detail is in [docs/mlx_native_workflows.md](docs/mlx_native_workflows.md).
 
