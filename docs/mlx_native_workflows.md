@@ -43,7 +43,7 @@ Keep dense Comfy weights in the normal Comfy model folders. Keep MLX packages or
 | Z-Image Turbo BF16 | [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo), [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | `models/diffusion_models/z_image_turbo_bf16.safetensors` or equivalent local filename used by the alias |
 | LTX 2.3 stock/reference | [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | Dense Comfy files under `models/checkpoints`, `models/loras`, text encoder, VAE, and upscaler folders |
 | LTX 2.3 MLX native dev+LoRA BF16 | Stock [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) BF16 dev checkpoint and distilled LoRA, loaded through MLX | Experimental manifest such as `ltx23_dev_lora_mlx_bf16_native.mlx_ltx.json`; uses `pipeline: dev_lora`, `ltx-2.3-22b-dev.safetensors`, and LoRA strength `0.5`; does not require preconverted MLX dev weights |
-| LTX 2.3 MLX dev BF16 package candidate | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) | Optional unvalidated package path containing `transformer-dev.safetensors`; not required by the current native dev+LoRA BF16 validation row |
+| LTX 2.3 MLX dev BF16 package + LoRA | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) | Validated package path containing `transformer-dev.safetensors`, `transformer-distilled.safetensors`, and companion LTX assets; use with LoRA strength `0.5` for the dev-package route |
 | LTX 2.3 MLX distilled BF16 context | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) | Distilled package folder containing `transformer-distilled.safetensors` or `transformer-distilled-1.1.safetensors`, VAE/audio/vocoder/connector files, and x2 upscaler files |
 | LTX 2.3 MLX distilled Q8/Q4 context packages | [dgrauet/ltx-2.3-mlx-q8](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8), [dgrauet/ltx-2.3-mlx-q4](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) | Optional quantized distilled package roots with the same folder layout as the BF16 distilled package |
 
@@ -74,12 +74,15 @@ The current clean guarded review pass is summarized below. Raw benchmark harness
 | LTX 2.3 BF16 dev+LoRA I2V | 512x512 / 49f | 191.99s | Clean run, MLX route proof, valid MP4/audio |
 | LTX 2.3 BF16 dev+LoRA First-Last | 512x512 / 49f | 281.09s | Clean run, MLX route proof, sparse guide attention, valid MP4/audio |
 | LTX 2.3 BF16 dev+LoRA T2V | 1280x768 / 121f | 929.56s | Clean run, MLX route proof, valid MP4/audio |
+| LTX 2.3 BF16 dev package + LoRA T2V | 1280x768 / 121f | 906.32s avg | Clean run, MLX route proof, valid MP4/audio |
 
 The separate native T2V timing pass for LTX dev+LoRA is:
 
 `benchmarks/mlx_vs_baselines/results/ltx23_dev_lora_mlx_native_t2v_timing_20260614-180654/`
 
 It measured `ComfyUI-MLX LTX 2.3 BF16 dev+LoRA native T2V workflow` at `1280x768 / 121f / 24fps` with a scored average of `948.32s`. Historical distilled-package rows at `1024x768 / 120f` measured about `629-648s`; those are useful context but are not strict apples-to-apples with the native dev+LoRA 1280x768 workflow.
+
+The validated `dgrauet/ltx-2.3-mlx` dev package route measured `906.32s` at `1280x768 / 121f` in `ltx23_mlx_bf16_dev_weight_compare_20260615-175827`, which was `49.13s` faster than the stock-dev safetensor MLX route at `955.45s` on the same native T2V workflow, a `+5.1%` improvement.
 
 ### Historical LTX Distilled Context
 
@@ -93,10 +96,10 @@ Those examples use the distilled MLX package layout. The Q8 and BF16 distilled p
 For LTX there are two distinct MLX paths:
 
 - Native dev+LoRA BF16: use the stock BF16 dev checkpoint `ltx-2.3-22b-dev.safetensors` and the local distilled LoRA at strength `0.5`; this runs through MLX but does not require preconverted MLX dev weights.
-- MLX dev package candidate: `dgrauet/ltx-2.3-mlx` appears to include `transformer-dev.safetensors`, but this fork has not yet validated that package path.
+- MLX dev package + LoRA: use `transformer-dev.safetensors` from `dgrauet/ltx-2.3-mlx` with the same LoRA strength `0.5`.
 - Distilled MLX package: use one of `dgrauet/ltx-2.3-mlx`, `dgrauet/ltx-2.3-mlx-q8`, or `dgrauet/ltx-2.3-mlx-q4`, where the package folder contains `transformer-distilled.safetensors` or `transformer-distilled-1.1.safetensors` and the companion media files.
 
-In other words, `MLX native dev+LoRA BF16` means MLX execution with the stock BF16 dev safetensor loaded into MLX arrays, not a separate preconverted dev transformer package. `MLX distilled BF16/Q8/Q4` means the distilled transformer comes directly from the MLX package folder.
+In other words, `MLX native dev+LoRA BF16` means MLX execution with the stock BF16 dev safetensor loaded into MLX arrays. `MLX dev package + LoRA BF16` uses the package `transformer-dev.safetensors`. `MLX distilled BF16/Q8/Q4` means the distilled transformer comes directly from the MLX package folder.
 
 Older local distilled-package benchmark artifacts are useful context for the faster LTX path, but they are not the same as native dev+LoRA BF16 validation.
 
